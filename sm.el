@@ -109,8 +109,13 @@
               sm--ewoc)
     (nreverse marked)))
 
-(defun sm-switch-branch ()
+(defun sm-branch-switch ()
   "Switch branch of repo at point."
+  ;; TODO define the semantics of how this should work when there are
+  ;; marked repos, e.g. switch one at a time or assume that there will
+  ;; be a branch name common among all repos. Can probably define
+  ;; `sm--branch-switch-internal' to carry out the logic which is
+  ;; shared in the repo-at-point vs marked repos cases.
   (interactive)
   (let ((node (ewoc-locate sm--ewoc)))
     (unless node
@@ -128,14 +133,13 @@
       (setf (sm--repo-info->branch repo) name))
     (ewoc-invalidate sm--ewoc node)))
 
-;; TODO sm--checkout-repo
 ;; TODO sm--pull-repo
 
 ;; TODO sm-commit command that prompts to commit
 ;; unstaged changes in the submodules before commiting the parent.
 
-;; TODO sm-vc-dir: open repo at point in vc dir
 ;; TODO sm-push: push changes for marked repos or repo at point
+;; TODO sm-branch-new key: b n
 
 (defun sm-vc-dir ()
   "Open the repo at point in `vc-dir'."
@@ -151,14 +155,6 @@
     (unless node
       (user-error "No repo at point"))
     (ewoc-data node)))
-
-(defun sm-checkout ()
-  "Check out marked repos or repo at point."
-  (interactive)
-  (if-let (marked-repos (sm--get-marked-repos))
-      (dolist (repo marked-repos)
-        (sm--checkout-repo repo))
-    (sm--checkout-repo (sm--repo-at-point))))
 
 (defun sm-pull ()
   "Pull marked repos or repo at point."
@@ -241,8 +237,7 @@
 (sm--branches-containing-head "~/code/watch_n_draw_build/directory-slideshow/")
 ;;=> ("foobranch" "main")
 
-
-(defun sm-attach-head ()
+(defun sm-branch-attach ()
   "Check out a branch containing HEAD for the (detached) repo at point."
   (interactive)
   (let* ((node (ewoc-locate sm--ewoc))
@@ -255,6 +250,8 @@
                    (_ (completing-read "Attach to branch: " branches nil t)))))
     (let ((default-directory dir))
       (vc-retrieve-tag dir branch))
+    ;; FIXME isn't vc-retrieve-tag async? does that matter?
+    ;; TODO I should deal with this properly
     (setf (sm--repo-info->branch repo) branch
           (sm--repo-info->detached-head? repo) nil)
     (ewoc-invalidate sm--ewoc node)))
@@ -350,8 +347,6 @@
   "Return t if remote has unpulled changes, else NIL.
 Applies to git repo rooted at DIR."
   (let ((default-directory dir))
-    ;; FIXME: this checks if there's an upstream, but fails in a
-    ;; detached head state.
     (and (zerop (call-process vc-git-program nil nil nil
                               "rev-parse" "--verify" "--quiet" "@{upstream}"))
          (process-lines vc-git-program "rev-list" "-1" "HEAD..@{upstream}")
@@ -465,7 +460,8 @@ BRANCH is nil when HEAD is detached."
     (define-key map (kbd "RET") #'sm-vc-dir)
     (let ((branch-map (make-sparse-keymap)))
       (define-key map "b" branch-map)
-      (define-key branch-map "s" #'sm-switch-branch))
+      (define-key branch-map "s" #'sm-branch-switch')
+      (define-key branch-map "a" #'sm-branch-attach))
     map)
   "Keymap for directory buffer.")
 
