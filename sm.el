@@ -23,32 +23,111 @@
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
-;; TODO see dired.el, specifically look at font-lock-defaults which
-;; defines how marked files/dirs get highlighted differently. I can do
-;; the same thing for marked repos.
-
 ;; NOTE: Maybe this should work with mercurial as well?
-
-;; UI:
-;; foo -> main -> up to date
-;; |--- bar -> (das3fs9) main -> up to date
-;; |--- baz -> (das3fs9) feature -> unpulled changes
-;; |--- qux -> feature -> uncommitted changes
 
 ;;; Code:
 (require 'ewoc)
 (require 'vc)
+(require 'vc-git)
+
+(defgroup sm nil
+  "Simple UI for managing git submodules."
+  :group 'vc)
+
+(defface sm-header
+  '((t :inherit vc-dir-header-value))
+  "Face for the project name in the header."
+  :group 'sm)
+
+(defface sm-mark-indicator-face
+  '((t :inherit dired-mark)) ;; TODO: do I need to require dired?
+  "Face for the mark indicator."
+  :group 'sm)
+
+(defface sm-repo-path-face
+  '((t :inherit dired-directory))
+  "Face for submodule paths."
+  :group 'sm)
+
+(defface sm-checkout-face
+  '((t :inherit vc-dir-status-up-to-date))
+  "Face for the checked-out branch or commit."
+  :group 'sm)
+
+(defface sm-status-ok-face
+  '((t :inherit shadow))
+  "Face for status messages when a submodule is up to date."
+  :group 'sm)
+
+(defface sm-status-attention-face
+  '((t :inherit warning))
+  "Face for status messages when a submodule needs attention."
+  :group 'sm)
+
+(defface sm-marked-face
+  '((t :inherit dired-marked))
+  "Face overlaid on marked entries."
+  :group 'sm)
+
+(defun sm--repo-status-face (repo)
+  (if (or (sm--repo-info->unpulled-changes? repo)
+          (sm--repo-info->uncommitted-changes? repo))
+      'sm-status-attention-face
+    'sm-status-ok-face))
 
 (defun sm-mark ()
-  "Mark repo on the line at point."
+  "Mark the repo at point and move to the next entry."
   (interactive)
-  (save-excursion
-    (goto-char (line-beginning-position))
-    (insert "+"))
-  (next-line))
+  (let ((node (ewoc-locate sm--ewoc)))
+    (unless node
+      (user-error "No repo at point"))
+    (setf (sm--repo-info->marked? (ewoc-data node)) t)
+    (let ((inhibit-read-only t))
+      (ewoc-invalidate sm--ewoc node))
+    (when-let ((next (ewoc-next sm--ewoc node)))
+      (ewoc-goto-node sm--ewoc next))))
 
-;; TODO sm--get-marked-repos
-;; TODO sm--repo-at-point
+(defun sm-unmark ()
+  "Unmark the repo at point and move to the next entry."
+  (interactive)
+  (let ((node (ewoc-locate sm--ewoc)))
+    (unless node
+      (user-error "No repo at point"))
+    (setf (sm--repo-info->marked? (ewoc-data node)) nil)
+    (let ((inhibit-read-only t))
+      (ewoc-invalidate sm--ewoc node))
+    (when-let ((next (ewoc-next sm--ewoc node)))
+      (ewoc-goto-node sm--ewoc next))))
+
+(defun sm--get-marked-repos ()
+  "Return a list of marked `sm--repo-info's."
+  (let (marked)
+    (ewoc-map (lambda (repo)
+                (when (sm--repo-info->marked? repo)
+                  (push repo marked))
+                nil)  ; nil = don't re-render this node
+              sm--ewoc)
+    (nreverse marked)))
+
+(defun sm-switch-branch ()
+  "Switch branch of repo at point."
+  (interactive)
+  (let ((node (ewoc-locate sm--ewoc)))
+    (unless node
+      (user-error "No repo at point"))
+    (let* ((repo (ewoc-data node))
+           (dir (expand-file-name (sm--repo-info->rel-path repo)
+                                  (sm--root-dir)))
+           (default-directory dir)
+           (name (vc-read-revision (format-prompt "Switch to branch" "latest revisions")
+                                   (list dir)
+                                   (vc-responsible-backend dir))))
+      (vc-retrieve-tag dir name)
+      ;; FIXME isn't vc-retrieve-tag async? does that matter?
+      ;; TODO I should deal with this properly
+      (setf (sm--repo-info->branch repo) name))
+    (ewoc-invalidate sm--ewoc node)))
+
 ;; TODO sm--checkout-repo
 ;; TODO sm--pull-repo
 
@@ -58,16 +137,24 @@
 ;; TODO sm-vc-dir: open repo at point in vc dir
 ;; TODO sm-push: push changes for marked repos or repo at point
 
-;; TODO helper: (sm--get-status repo) - return list (plist? alist?) of
-;; - checked out (hash or branch)
-;; - branch associated with checked-out
-;; - status message
+(defun sm-vc-dir ()
+  "Open the repo at point in `vc-dir'."
+  (interactive)
+  (let* ((repo (sm--repo-at-point))
+         (dir (expand-file-name (sm--repo-info->rel-path repo)
+                                (sm--root-dir))))
+    (vc-dir dir)))
+
+(defun sm--repo-at-point ()
+  "Return the `sm--repo-info' for the entry at point, or signal an error."
+  (let ((node (ewoc-locate sm--ewoc)))
+    (unless node
+      (user-error "No repo at point"))
+    (ewoc-data node)))
 
 (defun sm-checkout ()
   "Check out marked repos or repo at point."
   (interactive)
-  ;; TODO figured out what a "repo" is, e.g. what info is needed in
-  ;; that data structure.
   (if-let (marked-repos (sm--get-marked-repos))
       (dolist (repo marked-repos)
         (sm--checkout-repo repo))
@@ -76,8 +163,6 @@
 (defun sm-pull ()
   "Pull marked repos or repo at point."
   (interactive)
-  ;; TODO figured out what a "repo" is, e.g. what info is needed in
-  ;; that data structure.
   (if-let (marked-repos (sm--get-marked-repos))
       (dolist (repo marked-repos)
         (sm--pull-repo repo))
@@ -96,6 +181,7 @@
 (defun sm--prepare-status-buffer (name dir)
   "Find a buffer named NAME showing DIR, or create a new one."
   (setq dir (file-name-as-directory (expand-file-name dir)))
+  (setq sm--buffers (cl-delete-if-not #'buffer-live-p sm--buffers))
   (let* ;; Look for another buffer name NAME visiting the same directory.
       ((buf (save-excursion
               (cl-dolist (buffer sm--buffers)
@@ -133,55 +219,97 @@
                (:copier nil)
                (:type list)
                (:constructor
-                sm-create-repo-info (rel-path commit branch branch-checked-out? status &optional marked))
+                sm-create-repo-info (rel-path commit branch detached-head? unpulled-changes? uncommitted-changes? &optional marked))
                (:conc-name sm--repo-info->))
   rel-path
   commit
   branch
-  branch-checked-out?
-  status
-  marked)
-;; up to date? uncommitted changes? unpulled changes?
+  detached-head?
+  unpulled-changes?
+  uncommitted-changes?
+  marked?)
 
-;; foo -> main -> up to date
-;; |--- bar -> (das3fs9) main -> up to date
-;; |--- baz -> (das3fs9) feature -> unpulled changes
-;; |--- qux -> feature -> uncommitted changes
+(defun sm--branches-containing-head (dir)
+  "Return branches containing HEAD in DIR, excluding the detached pseudo-entry."
+  (let ((default-directory dir))
+    (cl-remove-if (lambda (b) (string-prefix-p "(" b))
+                  (process-lines vc-git-program "branch" "--contains"
+                                 "HEAD" "--format=%(refname:short)"))))
+
+(sm--branches-containing-head "~/code/watch_n_draw_build/watchndraw/")
+;;=> ("main")
+(sm--branches-containing-head "~/code/watch_n_draw_build/directory-slideshow/")
+;;=> ("foobranch" "main")
+
+
+(defun sm-attach-head ()
+  "Check out a branch containing HEAD for the (detached) repo at point."
+  (interactive)
+  (let* ((node (ewoc-locate sm--ewoc))
+         (repo (ewoc-data node))
+         (dir (expand-file-name (sm--repo-info->rel-path repo) (sm--root-dir)))
+         (branches (sm--branches-containing-head dir))
+         (branch (pcase branches
+                   ('() (user-error "No branch contains this commit"))
+                   (`(,b) b)
+                   (_ (completing-read "Attach to branch: " branches nil t)))))
+    (let ((default-directory dir))
+      (vc-retrieve-tag dir branch))
+    (setf (sm--repo-info->branch repo) branch
+          (sm--repo-info->detached-head? repo) nil)
+    (ewoc-invalidate sm--ewoc node)))
 
 (defun sm--repo-info:status-msg (repo)
   "Return appropriate status message for REPO."
-  (pcase-exhaustive (sm--repo-info->status repo)
-    (:up-to-date "up to date")
-    (:unpulled-changes "unpulled changes")
-    (:uncommitted-changes "uncommitted changes")))
+  (if (sm--repo-info->detached-head? repo)
+      "detached HEAD"
+    (pcase-exhaustive (cons (sm--repo-info->unpulled-changes? repo)
+                            (sm--repo-info->uncommitted-changes? repo))
+      ('(nil) "up to date")
+      ('(t) "unpulled changes")
+      ('(nil . t) "uncommitted changes")
+      ('(t . t) "unpulled & uncommitted changes"))))
 
-(let ((repo-info (sm-create-repo-info "foo" "ae41jlsk" "feature-1" nil :up-to-date)))
-  (sm--repo-info:status-msg repo-info))
+;; (let ((repo-info (sm-create-repo-info "foo" "ae41jlsk" "feature-1" nil :up-to-date)))
+;;   (sm--repo-info:status-msg repo-info))
+;;=> "up to date"
+
+(defvar-local sm--column-widths nil
+  "Cons of (PATH-WIDTH . CHECKOUT-WIDTH) for aligning entries.")
+
+(defun sm--compute-column-widths (repos)
+  (cons
+   (apply #'max 0 (mapcar (lambda (r) (length (sm--repo-info->rel-path r))) repos))
+   (apply #'max 0 (mapcar (lambda (r)
+                            (length (if (sm--repo-info->detached-head? r)
+                                        (sm--repo-info->commit r)
+                                      (sm--repo-info->branch r))))
+                          repos))))
 
 (defun sm--repo-render (entry)
   "Render state of submodule ENTRY."
-  (insert
-   (propertize
-    (format "%c" (if (sm--repo-info->marked entry) ?* ? ))
-    'face 'sm-mark-indicator-face)
-   " └── "
-   (propertize
-    (format "%s" (sm--repo-info->rel-path entry))
-    'face 'sm-repo-path-face)
-   " "
-   (if (sm--repo-info->branch-checked-out? entry)
-       (propertize
-        (format "%s" (sm--repo-info->branch entry))
-        'face 'sm-checkout-face)
-     (propertize
-      (format "%s" (sm--repo-info->commit entry))
-      'face 'sm-checkout-face)
-     (propertize
-      (format " (%s)" (sm--repo-info:status-msg entry))
-      'face 'sm-status-msg-face))
-   "<- "
-   (propertize
-    (format "%s" (sm--repo-info->)))))
+  (let ((line (concat (propertize
+                       (format "%c" (if (sm--repo-info->marked? entry) ?* ? ))
+                       'face 'sm-mark-indicator-face)
+                      " └── "
+                      (propertize
+                       (format (format "%%-%ds" (car sm--column-widths))
+                               (sm--repo-info->rel-path entry))
+                       'face 'sm-repo-path-face)
+                      " "
+                      (propertize
+                       (format (format "%%-%ds" (cdr sm--column-widths))
+                               (if (sm--repo-info->detached-head? entry)
+                                   (sm--repo-info->commit entry)
+                                 (sm--repo-info->branch entry)))
+                       'face 'sm-checkout-face)
+                      " <- "
+                      (propertize
+                       (format "(%s)" (sm--repo-info:status-msg entry))
+                       'face (sm--repo-status-face entry)))))
+    (when (sm--repo-info->marked? entry)
+      (add-face-text-property 0 (length line) 'sm-marked-face nil line))
+    (insert line)))
 
 (defun sm--root-dir ()
   "Return VC root of `default-directory', or nil."
@@ -197,17 +325,122 @@
 (defun sm-headers ()
   "Display the headers *SM* buffer."
   (concat
-   (propertize (format "%s" (sm--project-root-name)) 'face 'sm-header)
-   "\n"))
-
-(defun sm--project-get-repos ()
-  "Return a list of `sm--repo-info's for each git submodule"
-  (message "called")
-  nil)
+   (mapconcat
+    (pcase-lambda (`(,key . ,desc))
+      (concat (propertize key 'face 'help-key-binding)
+              " " desc))
+    '(("m"   . "mark")
+      ("u"   . "unmark")
+      ("g"   . "refresh")
+      ("RET" . "vc-dir")
+      ("b s" . "switch branch"))
+    "  ")
+   "\n\n"
+   (propertize (format "%s" (sm--project-root-name)) 'face 'sm-header)))
 
 (defun sm--busy ()
   "TODO"
   nil)
+
+(defun sm--git-submodule-lines ()
+  "Return output lines of `git submodule status --recursive'."
+  (process-lines vc-git-program "submodule" "status" "--recursive"))
+
+(defun sm--unpulled-changes-p (dir branch)
+  "Return t if remote has unpulled changes, else NIL.
+Applies to git repo rooted at DIR."
+  (let ((default-directory dir))
+    ;; FIXME: this checks if there's an upstream, but fails in a
+    ;; detached head state.
+    (and (zerop (call-process vc-git-program nil nil nil
+                              "rev-parse" "--verify" "--quiet" "@{upstream}"))
+         (process-lines vc-git-program "rev-list" "-1" "HEAD..@{upstream}")
+         t)))
+
+;; git rev-list -1 HEAD..origin/foobranch
+
+
+(defun sm--uncommitted-changes-p (dir)
+  "Return t if remote has unpulled changes, else NIL.
+Applies to git repo rooted at DIR."
+  (let ((default-directory dir))
+    (and (process-lines vc-git-program "status" "--porcelain") t)))
+
+
+;; (sm--uncommitted-changes-p "~/code/watch_n_draw_build/Splice-Lang")
+;; ;;=> t
+;; (sm--uncommitted-changes-p "~/code/watch_n_draw_build/directory-slideshow")
+;; ;;=> nil
+;; (sm--unpulled-changes-p "~/code/watch_n_draw_build/watchndraw" "main")
+;; ;;=> t
+;; (sm--unpulled-changes-p "~/code/watch_n_draw_build/word_ladders" "main")
+;; ;;=> nil
+
+
+(defun sm--git-current-branch (dir)
+  "Return (BRANCH . DETACHED-HEAD?) for repo DIR.
+BRANCH is nil when HEAD is detached."
+  (let ((default-directory dir))
+    (pcase (process-lines-ignore-status vc-git-program "branch" "--show-current")
+      (`(,branch) (cons branch nil))
+      ('() (cons nil t)))))
+
+;; (sm--git-current-branch "~/code/watch_n_draw_build/Splice-Lang/")
+;;=> ("main")
+
+;;=> ("main")
+
+;;=> (nil)
+
+;;=> (nil)
+
+;;=> (nil)
+
+;; (sm--git-current-branch "~/code/watch_n_draw_build/watchndraw/")
+;;=> (nil . t)
+
+;;=> ("main" . t)
+
+;;=> ("(HEAD detached at 667d148)" . t)
+
+;;=> ("(HEAD detached at 667d148)" . t)
+
+;;=> ("(HEAD detached at 667d148)" . t)
+
+;;=> (nil . t)
+
+;;=> ("main" . t)
+
+;; (sm--git-current-branch "~/code/watch_n_draw_build/directory-slideshow/")
+;;=> (nil . t)
+
+;;=> ("foobranch" . t)
+
+;;=> ("(HEAD detached at 647df9d)" . t)
+
+;;=> (nil . t)
+
+;;=> ("main" . t)
+
+(defun sm--project-get-repos ()
+  "Return a list of `sm--repo-info's for each git submodule, recursively."
+  (mapcar
+   (lambda (line)
+     (pcase-let* ((`(,commit ,rel-path) (split-string (substring line 1)))
+                  (dir (expand-file-name rel-path (sm--root-dir)))
+                  (`(,branch . ,detached-head?) (sm--git-current-branch dir))
+                  (unpulled-changes? (and (not detached-head?) (sm--unpulled-changes-p dir branch)))
+                  (uncommitted-changes? (sm--uncommitted-changes-p dir)))
+       (sm-create-repo-info rel-path
+                            (substring commit 0 8)
+                            branch
+                            detached-head?
+                            unpulled-changes?
+                            uncommitted-changes?)))
+   (sm--git-submodule-lines)))
+;; (let ((default-directory "~/code/watch_n_draw_build/"))
+;;   (sm--project-get-repos))
+;;=> (("watchndraw" "667d148d" "main" t :up-to-date nil))
 
 (defun sm-refresh ()
   "Refresh the contents of the *SM* buffer.
@@ -215,15 +448,21 @@
   (interactive)
   (if (sm--busy)
       (error "Another update process is in progress, cannot run two at a time")
-    (ewoc-set-hf sm--ewoc (sm-headers) "")
-    (mapc (lambda (entry)
-            "TODO update sm--ewoc")
-          (sm--project-get-repos))))
+    (let ((inhibit-read-only t))
+      (ewoc-set-hf sm--ewoc (sm-headers) "")
+      (ewoc-filter sm--ewoc #'ignore)
+      (let ((repos (sm--project-get-repos)))
+        (setq sm--column-widths (sm--compute-column-widths repos))
+        (ewoc-filter sm--ewoc #'ignore)
+        (dolist (repo repos)
+          (ewoc-enter-last sm--ewoc repo))))))
 
 (defvar sm-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map "m" #'sm-mark)
+    (define-key map "u" #'sm-unmark)
     (define-key map "g" #'sm-refresh)
+    (define-key map (kbd "RET") #'sm-vc-dir)
     (let ((branch-map (make-sparse-keymap)))
       (define-key map "b" branch-map)
       (define-key branch-map "s" #'sm-switch-branch))
@@ -239,6 +478,7 @@
     ;; (setq-local revert-buffer-function 'vc-dir-revert-buffer-function)
     (setq list-buffers-directory (expand-file-name "*sm*" default-directory))
     (hack-dir-local-variables-non-file-buffer)
+    (cl-pushnew (current-buffer) sm--buffers)
     (sm-refresh)))
 
 (provide 'sm)
