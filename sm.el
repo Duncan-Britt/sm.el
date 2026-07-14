@@ -69,11 +69,33 @@
   "Face overlaid on marked entries."
   :group 'sm)
 
+(defvar sm--ewoc nil)
+
+(cl-defstruct (sm--repo-info
+               (:copier nil)
+               (:type list)
+               (:constructor
+                sm-create-repo-info (rel-path commit branch detached-head? unpulled-changes? uncommitted-changes? &optional marked))
+               (:conc-name sm--repo-info->))
+  rel-path
+  commit
+  branch
+  detached-head?
+  unpulled-changes?
+  uncommitted-changes?
+  marked?)
+
 (defun sm--repo-status-face (repo)
   (if (or (sm--repo-info->unpulled-changes? repo)
           (sm--repo-info->uncommitted-changes? repo))
       'sm-status-attention-face
     'sm-status-ok-face))
+
+(defun sm--mark-internal (node)
+  "Mark ewoc NODE."
+  (setf (sm--repo-info->marked? (ewoc-data node)) t)
+  (let ((inhibit-read-only t))
+    (ewoc-invalidate sm--ewoc node)))
 
 (defun sm-mark ()
   "Mark the repo at point and move to the next entry."
@@ -81,11 +103,15 @@
   (let ((node (ewoc-locate sm--ewoc)))
     (unless node
       (user-error "No repo at point"))
-    (setf (sm--repo-info->marked? (ewoc-data node)) t)
-    (let ((inhibit-read-only t))
-      (ewoc-invalidate sm--ewoc node))
+    (sm--mark-internal node)
     (when-let ((next (ewoc-next sm--ewoc node)))
       (ewoc-goto-node sm--ewoc next))))
+
+(defun sm--unmark-internal (node)
+  "Unmark ewoc NODE."
+  (setf (sm--repo-info->marked? (ewoc-data node)) nil)
+  (let ((inhibit-read-only t))
+    (ewoc-invalidate sm--ewoc node)))
 
 (defun sm-unmark ()
   "Unmark the repo at point and move to the next entry."
@@ -93,11 +119,25 @@
   (let ((node (ewoc-locate sm--ewoc)))
     (unless node
       (user-error "No repo at point"))
-    (setf (sm--repo-info->marked? (ewoc-data node)) nil)
-    (let ((inhibit-read-only t))
-      (ewoc-invalidate sm--ewoc node))
+    (sm--unmark-internal node)
     (when-let ((next (ewoc-next sm--ewoc node)))
       (ewoc-goto-node sm--ewoc next))))
+
+(defun sm-mark-all ()
+  "Mark all repos."
+  (interactive)
+  (let ((node (ewoc-nth sm--ewoc 0)))
+    (while node
+      (sm--mark-internal node)
+      (setq node (ewoc-next sm--ewoc node)))))
+
+(defun sm-unmark-all ()
+  "Unmark all repos."
+  (interactive)
+  (let ((node (ewoc-nth sm--ewoc 0)))
+    (while node
+      (sm--unmark-internal node)
+      (setq node (ewoc-next sm--ewoc node)))))
 
 (defun sm--get-marked-repos ()
   "Return a list of marked `sm--repo-info's."
@@ -109,29 +149,50 @@
               sm--ewoc)
     (nreverse marked)))
 
+(defun sm--get-marked-ewoc-nodes ()
+  "Return a list of ewoc nodes whose repos are marked."
+  (let ((marked nil)
+        (node (ewoc-nth sm--ewoc 0)))
+    (while node
+      (when (sm--repo-info->marked? (ewoc-data node))
+        (push node marked))
+      (setq node (ewoc-next sm--ewoc node)))
+    (nreverse marked)))
+
+;; (mapcar #'ewoc-data (sm--get-marked-ewoc-nodes))
+
+(defun sm--branch-switch-internal (node)
+  "Switch vc branch of repo at ewoc NODE and update UI."
+  (let* ((repo (ewoc-data node))
+         (dir (expand-file-name (sm--repo-info->rel-path repo)
+                                (sm--root-dir)))
+         (default-directory dir)
+         (name (vc-read-revision (format-prompt "Switch %s to branch" "latest revisions" (sm--repo-info->rel-path repo))
+                                 (list dir)
+                                 (vc-responsible-backend dir))))
+    (vc-retrieve-tag dir name)
+    ;; FIXME isn't vc-retrieve-tag async? does that matter?
+    ;; TODO I should deal with this properly
+    (setf (sm--repo-info->branch repo) name))
+  (ewoc-invalidate sm--ewoc node))
+
+(defun sm-branch-switch-dwim ()
+  "Switch branch of marked repos or repo at point.
+If multiple repos are marked, completing read of branch names common
+among all marked repos, or user-error if there are no options."
+  (if-let (marked-nodes (sm--get-marked-ewoc-nodes))
+      (progn
+        'todo)
+    (sm--branch-switch-internal (ewoc-locate sm--ewoc))))
+
 (defun sm-branch-switch ()
-  "Switch branch of repo at point."
-  ;; TODO define the semantics of how this should work when there are
-  ;; marked repos, e.g. switch one at a time or assume that there will
-  ;; be a branch name common among all repos. Can probably define
-  ;; `sm--branch-switch-internal' to carry out the logic which is
-  ;; shared in the repo-at-point vs marked repos cases.
+  "Switch branch of marked repos or repo at point.
+If multiple repos are marked, switch branches one at a time."
   (interactive)
-  (let ((node (ewoc-locate sm--ewoc)))
-    (unless node
-      (user-error "No repo at point"))
-    (let* ((repo (ewoc-data node))
-           (dir (expand-file-name (sm--repo-info->rel-path repo)
-                                  (sm--root-dir)))
-           (default-directory dir)
-           (name (vc-read-revision (format-prompt "Switch to branch" "latest revisions")
-                                   (list dir)
-                                   (vc-responsible-backend dir))))
-      (vc-retrieve-tag dir name)
-      ;; FIXME isn't vc-retrieve-tag async? does that matter?
-      ;; TODO I should deal with this properly
-      (setf (sm--repo-info->branch repo) name))
-    (ewoc-invalidate sm--ewoc node)))
+  (if-let (marked-nodes (sm--get-marked-ewoc-nodes))
+      (dolist (node marked-nodes)
+        (sm--branch-switch-internal node))
+    (sm--branch-switch-internal (ewoc-locate sm--ewoc))))
 
 ;; TODO sm--pull-repo
 
@@ -207,24 +268,6 @@
       (sm-refresh)
     (sm-mode)))
 
-;; I can explore or use `vc-switch-branch' which does completing read over available branches
-
-(defvar sm--ewoc nil)
-
-(cl-defstruct (sm--repo-info
-               (:copier nil)
-               (:type list)
-               (:constructor
-                sm-create-repo-info (rel-path commit branch detached-head? unpulled-changes? uncommitted-changes? &optional marked))
-               (:conc-name sm--repo-info->))
-  rel-path
-  commit
-  branch
-  detached-head?
-  unpulled-changes?
-  uncommitted-changes?
-  marked?)
-
 (defun sm--branches-containing-head (dir)
   "Return branches containing HEAD in DIR, excluding the detached pseudo-entry."
   (let ((default-directory dir))
@@ -232,22 +275,22 @@
                   (process-lines vc-git-program "branch" "--contains"
                                  "HEAD" "--format=%(refname:short)"))))
 
-(sm--branches-containing-head "~/code/watch_n_draw_build/watchndraw/")
+;; (sm--branches-containing-head "~/code/watch_n_draw_build/watchndraw/")
 ;;=> ("main")
-(sm--branches-containing-head "~/code/watch_n_draw_build/directory-slideshow/")
+;; (sm--branches-containing-head "~/code/watch_n_draw_build/directory-slideshow/")
 ;;=> ("foobranch" "main")
 
-(defun sm-branch-attach ()
-  "Check out a branch containing HEAD for the (detached) repo at point."
-  (interactive)
-  (let* ((node (ewoc-locate sm--ewoc))
-         (repo (ewoc-data node))
+(defun sm--branch-attach-internal (node)
+  "Check out a branch containing HEAD for the repo of NODE."
+  (let* ((repo (ewoc-data node))
          (dir (expand-file-name (sm--repo-info->rel-path repo) (sm--root-dir)))
          (branches (sm--branches-containing-head dir))
          (branch (pcase branches
                    ('() (user-error "No branch contains this commit"))
                    (`(,b) b)
-                   (_ (completing-read "Attach to branch: " branches nil t)))))
+                   (_ (completing-read (format "Attach %s to branch: "
+                                               (sm--repo-info->rel-path repo))
+                                       branches nil t)))))
     (let ((default-directory dir))
       (vc-retrieve-tag dir branch))
     ;; FIXME isn't vc-retrieve-tag async? does that matter?
@@ -255,6 +298,15 @@
     (setf (sm--repo-info->branch repo) branch
           (sm--repo-info->detached-head? repo) nil)
     (ewoc-invalidate sm--ewoc node)))
+
+(defun sm-branch-attach ()
+  "Check out a branch containing HEAD for the (detached) repo at point or
+marked repos."
+  (interactive)
+  (if-let (marked-nodes (sm--get-marked-ewoc-nodes))
+      (dolist (node marked-nodes)
+        (sm--branch-attach-internal node))
+    (sm--branch-attach-internal (ewoc-locate sm--ewoc))))
 
 (defun sm--repo-info:status-msg (repo)
   "Return appropriate status message for REPO."
@@ -323,14 +375,19 @@
   "Display the headers *SM* buffer."
   (concat
    (mapconcat
-    (pcase-lambda (`(,key . ,desc))
-      (concat (propertize key 'face 'help-key-binding)
-              " " desc))
-    '(("m"   . "mark")
-      ("u"   . "unmark")
-      ("g"   . "refresh")
-      ("RET" . "vc-dir")
-      ("b s" . "switch branch"))
+    (pcase-lambda (`(,cmd . ,desc))
+      (let ((key (where-is-internal cmd sm-mode-map t)))
+        (concat (propertize (if key (key-description key) "M-x")
+                            'face 'help-key-binding)
+                " " desc)))
+    '((sm-mark          . "mark")
+      (sm-unmark        . "unmark")
+      (sm-refresh       . "refresh")
+      (sm-vc-dir        . "vc-dir")
+      (sm-branch-switch . "switch branch")
+      (sm-branch-attach . "attach branch")
+      (sm-mark-all      . "mark all")
+      (sm-unmark-all    . "unmark all"))
     "  ")
    "\n\n"
    (propertize (format "%s" (sm--project-root-name)) 'face 'sm-header)))
@@ -455,12 +512,14 @@ BRANCH is nil when HEAD is detached."
 (defvar sm-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map "m" #'sm-mark)
+    (define-key map "M" #'sm-mark-all)
     (define-key map "u" #'sm-unmark)
+    (define-key map "U" #'sm-unmark-all)
     (define-key map "g" #'sm-refresh)
     (define-key map (kbd "RET") #'sm-vc-dir)
     (let ((branch-map (make-sparse-keymap)))
       (define-key map "b" branch-map)
-      (define-key branch-map "s" #'sm-branch-switch')
+      (define-key branch-map "s" #'sm-branch-switch)
       (define-key branch-map "a" #'sm-branch-attach))
     map)
   "Keymap for directory buffer.")
