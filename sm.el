@@ -4,8 +4,8 @@
 ;; Contact: https://github.com/Duncan-Britt/sm.el/issues
 ;; URL: https://github.com/Duncan-Britt/sm.el
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "30.2") (transient "0.12.0"))
-;; Keywords: hypermedia, srs, memory
+;; Package-Requires: ((emacs "26.0"))
+;; Keywords: vc
 
 ;; This file is NOT part of GNU Emacs.
 
@@ -23,12 +23,36 @@
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
-;; NOTE: Maybe this should work with mercurial as well?
+;; Should you find yourself developing a software project composed of
+;; tightly coupled git submodules, sm.el (Sub-Module) is here to help
+;; you by providing visibility into the state of all your submodules
+;; and convenience to frequently used git commands, especially when
+;; you need to carry out the same action accross multiple git
+;; submodules.
 
 ;;; Code:
 (require 'ewoc)
 (require 'vc)
 (require 'vc-git)
+
+(defun sm--assoc-delete-all (key alist &optional test)
+  "Delete from ALIST all elements whose car is KEY.
+Compare keys with TEST.  Defaults to `equal'.
+Return the modified alist.
+Elements of ALIST that are not conses are ignored."
+  (if (fboundp 'assoc-delete-all)
+      (assoc-delete-all key alist test)
+    (unless test (setq test #'equal))
+    (while (and (consp (car alist))
+                (funcall test (caar alist) key))
+      (setq alist (cdr alist)))
+    (let ((tail alist) tail-cdr)
+      (while (setq tail-cdr (cdr tail))
+        (if (and (consp (car tail-cdr))
+                 (funcall test (caar tail-cdr) key))
+            (setcdr tail (cdr tail-cdr))
+          (setq tail tail-cdr))))
+    alist))
 
 (defgroup sm nil
   "Simple UI for managing git submodules."
@@ -69,13 +93,18 @@
   "Face overlaid on marked entries."
   :group 'sm)
 
+(defface sm-status-busy-face
+  '((t :inherit compilation-mode-line-run))
+  "Face for status of a submodule with an operation in progress."
+  :group 'sm)
+
 (defvar sm--ewoc nil)
 
 (cl-defstruct (sm--repo-info
                (:copier nil)
                (:type list)
                (:constructor
-                sm-create-repo-info (rel-path commit branch detached-head? unpulled-changes? uncommitted-changes? &optional marked))
+                sm-create-repo-info (rel-path commit branch detached-head? unpulled-changes? uncommitted-changes? &optional marked?))
                (:conc-name sm--repo-info->))
   rel-path
   commit
@@ -159,48 +188,111 @@
       (setq node (ewoc-next sm--ewoc node)))
     (nreverse marked)))
 
-;; (mapcar #'ewoc-data (sm--get-marked-ewoc-nodes))
-
-(defun sm--branch-switch-internal (node)
-  "Switch vc branch of repo at ewoc NODE and update UI."
+(defun sm--switch-node-to-branch (node branch &optional callback)
+  "Asynchronously switch repo at ewoc NODE to BRANCH and update UI."
   (let* ((repo (ewoc-data node))
-         (dir (expand-file-name (sm--repo-info->rel-path repo)
-                                (sm--root-dir)))
-         (default-directory dir)
-         (name (vc-read-revision (format-prompt "Switch %s to branch" "latest revisions" (sm--repo-info->rel-path repo))
-                                 (list dir)
-                                 (vc-responsible-backend dir))))
-    (vc-retrieve-tag dir name)
-    ;; FIXME isn't vc-retrieve-tag async? does that matter?
-    ;; TODO I should deal with this properly
-    (setf (sm--repo-info->branch repo) name))
-  (ewoc-invalidate sm--ewoc node))
+         (rel-path (sm--repo-info->rel-path repo))
+         (dir (expand-file-name rel-path (sm--root-dir))))
+    (sm--run-git-on-node
+     node "sm-switch" "switching branch" (list "checkout" branch)
+     (lambda ()
+       (setf (sm--repo-info->commit repo) (sm--head-commit)
+             (sm--repo-info->branch repo) branch
+             (sm--repo-info->detached-head? repo) nil
+             (sm--repo-info->unpulled-changes? repo)
+             (sm--unpulled-changes-p dir branch)))
+     (format "Switched %s to %s" rel-path branch)
+     callback)))
 
-(defun sm-branch-switch-dwim ()
-  "Switch branch of marked repos or repo at point.
-If multiple repos are marked, completing read of branch names common
-among all marked repos, or user-error if there are no options."
-  (if-let (marked-nodes (sm--get-marked-ewoc-nodes))
-      (progn
-        'todo)
-    (sm--branch-switch-internal (ewoc-locate sm--ewoc))))
+(defun sm--branch-switch-internal (node &optional callback)
+  "Prompt for a branch and asynchronously switch the repo at ewoc NODE to it."
+  (let* ((repo (ewoc-data node))
+         (rel-path (sm--repo-info->rel-path repo))
+         (dir (expand-file-name rel-path (sm--root-dir)))
+         (branch (completing-read
+                  (format "Switch %s to branch: " rel-path)
+                  (sm--branch-candidates dir) nil t)))
+    (sm--switch-node-to-branch node branch callback)))
 
 (defun sm-branch-switch ()
   "Switch branch of marked repos or repo at point.
-If multiple repos are marked, switch branches one at a time."
+If multiple repos are marked, prompt for each in turn."
   (interactive)
-  (if-let (marked-nodes (sm--get-marked-ewoc-nodes))
-      (dolist (node marked-nodes)
-        (sm--branch-switch-internal node))
-    (sm--branch-switch-internal (ewoc-locate sm--ewoc))))
+  (sm--do-nodes-dwim "switched" #'sm--branch-switch-internal))
 
-;; TODO sm--pull-repo
+(defun sm-branch-switch-dwim ()
+  "Switch branch of marked repos or repo at point.
+With multiple marked repos, offer branches common to all of them;
+if there are none, fall back to prompting per repo."
+  (interactive)
+  (let ((marked-nodes (sm--get-marked-ewoc-nodes)))
+    (if-let ((_ (cdr marked-nodes))
+             (common (cl-reduce
+                      (lambda (a b) (cl-intersection a b :test #'string=))
+                      (mapcar (lambda (node)
+                                (sm--branch-candidates
+                                 (expand-file-name
+                                  (sm--repo-info->rel-path (ewoc-data node))
+                                  (sm--root-dir))))
+                              marked-nodes))))
+        (let ((branch (completing-read "Switch marked repos to branch: "
+                                       common nil t)))
+          (sm--do-nodes-dwim "switched"
+                             (lambda (node cb)
+                               (sm--switch-node-to-branch node branch cb))))
+      (sm--do-nodes-dwim "switched" #'sm--branch-switch-internal))))
 
-;; TODO sm-commit command that prompts to commit
-;; unstaged changes in the submodules before commiting the parent.
+(defun sm--branch-candidates (dir)
+  "Return local branch names plus short names of remote branches in DIR."
+  (let ((default-directory dir))
+    (delete-dups
+     (append
+      (process-lines vc-git-program "branch" "--format=%(refname:short)")
+      (mapcar (lambda (ref)
+                ;; "origin/feature" -> "feature"
+                (substring ref (1+ (cl-position ?/ ref))))
+              (process-lines vc-git-program "for-each-ref"
+                             "refs/remotes" "--format=%(refname:short)"
+                             "--exclude=refs/remotes/*/HEAD"))))))
 
-;; TODO sm-push: push changes for marked repos or repo at point
-;; TODO sm-branch-new key: b n
+(defun sm--create-node-branch (node branch &optional callback)
+  "Asynchronously create and switch to BRANCH for the repo at ewoc NODE."
+  (let* ((repo (ewoc-data node))
+         (rel-path (sm--repo-info->rel-path repo)))
+    (sm--run-git-on-node
+     node "sm-branch-new" "creating branch" (list "checkout" "-b" branch)
+     (lambda ()
+       (setf (sm--repo-info->commit repo) (sm--head-commit)
+             (sm--repo-info->branch repo) branch
+             (sm--repo-info->detached-head? repo) nil
+             (sm--repo-info->unpulled-changes? repo) nil))
+     (format "Created branch %s in %s" branch rel-path)
+     callback)))
+
+(defun sm--branch-new-internal (node &optional callback)
+  "Prompt for a name and asynchronously create a new branch for the repo at NODE."
+  (let* ((repo (ewoc-data node))
+         (rel-path (sm--repo-info->rel-path repo))
+         (branch (read-string (format "New branch for %s: " rel-path))))
+    (sm--create-node-branch node branch callback)))
+
+(defun sm-branch-new ()
+  "Create and switch to a new branch for marked repos or repo at point.
+If multiple repos are marked, prompt for each in turn."
+  (interactive)
+  (sm--do-nodes-dwim "branched" #'sm--branch-new-internal))
+
+(defun sm-branch-new-dwim ()
+  "Create and switch to a new branch for marked repos or repo at point.
+With multiple marked repos, prompt once and create the same branch
+name in all of them."
+  (interactive)
+  (if (cdr (sm--get-marked-ewoc-nodes))
+      (let ((branch (read-string "New branch for marked repos: ")))
+        (sm--do-nodes-dwim "branched"
+                           (lambda (node cb)
+                             (sm--create-node-branch node branch cb))))
+    (sm--do-nodes-dwim "branched" #'sm--branch-new-internal)))
 
 (defun sm-vc-dir ()
   "Open the repo at point in `vc-dir'."
@@ -217,18 +309,91 @@ If multiple repos are marked, switch branches one at a time."
       (user-error "No repo at point"))
     (ewoc-data node)))
 
+(defconst sm--log-buffer "*sm-log*"
+  "Name of the buffer logging failed sm operations.")
+
+(defun sm--log-failure (operation rel-path err)
+  "Append OPERATION failure ERR for REL-PATH to `sm--log-buffer'."
+  (with-current-buffer (get-buffer-create sm--log-buffer)
+    (special-mode)
+    (let ((inhibit-read-only t))
+      (goto-char (point-max))
+      (insert (format-time-string "[%F %T] ")
+              (propertize operation 'face 'error)
+              " "
+              (propertize rel-path 'face 'sm-repo-path-face)
+              "\n" err "\n\n"))))
+
+(defun sm--pull-repo (node &optional callback)
+  "Asynchronously pull the repo at ewoc NODE and update UI when done."
+  (let* ((repo (ewoc-data node))
+         (rel-path (sm--repo-info->rel-path repo)))
+    (if (sm--repo-info->detached-head? repo)
+        (if callback
+            (funcall callback rel-path "detached HEAD")
+          (user-error "Cannot pull %s: detached HEAD" rel-path))
+      (sm--run-git-on-node
+       node "sm-pull" "pulling" '("pull" "--ff-only")
+       (lambda ()
+         (setf (sm--repo-info->commit repo) (sm--head-commit)
+               (sm--repo-info->unpulled-changes? repo) nil))
+       (format "Pulled %s" rel-path)
+       callback))))
+
+(defun sm--do-nodes-dwim (verb operation)
+  "Run OPERATION on marked nodes, or the node at point.
+OPERATION is called with (NODE CALLBACK), where CALLBACK must
+eventually be called with (REL-PATH ERROR-STRING-OR-NIL).  When
+operating on marked nodes, failures are logged to `sm--log-buffer'
+and a single summary is messaged using VERB (e.g. \"pulled\")."
+  (if-let (marked-nodes (sm--get-marked-ewoc-nodes))
+      (let ((total (length marked-nodes))
+            (pending (length marked-nodes))
+            (failed 0))
+        (dolist (node marked-nodes)
+          (funcall operation node
+                   (lambda (rel-path err)
+                     (when err
+                       (cl-incf failed)
+                       (sm--log-failure verb rel-path err))
+                     (cl-decf pending)
+                     (when (zerop pending)
+                       (if (zerop failed)
+                           (message "%s %d repos" (capitalize verb) total)
+                         (message "%s %d repos, %d failed (see %s)"
+                                  (capitalize verb) (- total failed)
+                                  failed sm--log-buffer)
+                         (pop-to-buffer sm--log-buffer)))))))
+    (funcall operation (ewoc-locate sm--ewoc) nil)))
+
 (defun sm-pull ()
   "Pull marked repos or repo at point."
   (interactive)
-  (if-let (marked-repos (sm--get-marked-repos))
-      (dolist (repo marked-repos)
-        (sm--pull-repo repo))
-    (sm--pull-repo (sm--repo-at-point))))
+  (sm--do-nodes-dwim "pulled" #'sm--pull-repo))
+
+(defun sm--push-repo (node &optional callback)
+  "Asynchronously push the repo at ewoc NODE and update UI when done."
+  (let* ((repo (ewoc-data node))
+         (rel-path (sm--repo-info->rel-path repo)))
+    (if (sm--repo-info->detached-head? repo)
+        (if callback
+            (funcall callback rel-path "detached HEAD")
+          (user-error "Cannot push %s: detached HEAD" rel-path))
+      (sm--run-git-on-node
+       node "sm-push" "pushing" '("push")
+       #'ignore
+       (format "Pushed %s" rel-path)
+       callback))))
+
+(defun sm-push ()
+  "Push marked repos or repo at point."
+  (interactive)
+  (sm--do-nodes-dwim "pushed" #'sm--push-repo))
 
 (defvar sm--buffers nil "List of sm-mode buffers.")
 
 (defun sm--setup-buffer (buf)
-  "..."
+  "Setup *SM* buffer."
   (set-buffer (get-buffer-create buf))
   (kill-all-local-variables)
   (let ((buffer-undo-list t)
@@ -275,53 +440,111 @@ If multiple repos are marked, switch branches one at a time."
                   (process-lines vc-git-program "branch" "--contains"
                                  "HEAD" "--format=%(refname:short)"))))
 
-;; (sm--branches-containing-head "~/code/watch_n_draw_build/watchndraw/")
-;;=> ("main")
-;; (sm--branches-containing-head "~/code/watch_n_draw_build/directory-slideshow/")
-;;=> ("foobranch" "main")
+(defun sm--head-commit ()
+  "Return the abbreviated HEAD commit of the repo at `default-directory'."
+  (substring (car (process-lines vc-git-program "rev-parse" "HEAD")) 0 8))
 
-(defun sm--branch-attach-internal (node)
-  "Check out a branch containing HEAD for the repo of NODE."
+(defun sm--run-git-on-node (node proc-name busy-label args update-fn success-msg &optional callback)
+  "Run git ARGS asynchronously in the repo of ewoc NODE.
+PROC-NAME names the process and temp buffer.  BUSY-LABEL is shown in
+the entry's status while the operation runs (e.g. \"pulling\").  ..."
   (let* ((repo (ewoc-data node))
-         (dir (expand-file-name (sm--repo-info->rel-path repo) (sm--root-dir)))
-         (branches (sm--branches-containing-head dir))
-         (branch (pcase branches
-                   ('() (user-error "No branch contains this commit"))
-                   (`(,b) b)
-                   (_ (completing-read (format "Attach %s to branch: "
-                                               (sm--repo-info->rel-path repo))
-                                       branches nil t)))))
-    (let ((default-directory dir))
-      (vc-retrieve-tag dir branch))
-    ;; FIXME isn't vc-retrieve-tag async? does that matter?
-    ;; TODO I should deal with this properly
-    (setf (sm--repo-info->branch repo) branch
-          (sm--repo-info->detached-head? repo) nil)
-    (ewoc-invalidate sm--ewoc node)))
+         (rel-path (sm--repo-info->rel-path repo))
+         (dir (expand-file-name rel-path (sm--root-dir)))
+         (sm-buf (current-buffer))
+         (default-directory dir))
+    (if (sm--dir-busy-p dir)
+        (if callback
+            (funcall callback rel-path "another operation is in progress")
+          (user-error "%s: another operation is in progress" rel-path))
+      (let ((proc
+             (make-process
+              :name (format "%s:%s" proc-name rel-path)
+              :buffer (generate-new-buffer (format " *%s*" proc-name))
+              :command (cons vc-git-program args)
+              :sentinel
+              (lambda (proc _event)
+                (when (memq (process-status proc) '(exit signal))
+                  (let (err)
+                    (unwind-protect
+                        (if (not (zerop (process-exit-status proc)))
+                            (setq err (with-current-buffer (process-buffer proc)
+                                        (string-trim (buffer-string))))
+                          (let ((default-directory dir))
+                            (funcall update-fn)))
+                      (setq sm--processes (sm--assoc-delete-all dir sm--processes))
+                      (kill-buffer (process-buffer proc))
+                      (when (buffer-live-p sm-buf)
+                        (with-current-buffer sm-buf
+                          (let ((inhibit-read-only t))
+                            (ewoc-invalidate sm--ewoc node)))))
+                    (if callback
+                        (funcall callback rel-path err)
+                      (if err
+                          (message "git %s failed in %s: %s" (car args) rel-path err)
+                        (message "%s" success-msg)))))))))
+        (push (list dir proc busy-label) sm--processes)
+        (let ((inhibit-read-only t))
+          (ewoc-invalidate sm--ewoc node))))))
+
+(defun sm--branch-attach-internal (node &optional callback)
+  "Asynchronously check out a branch containing HEAD for the repo of NODE."
+  (let* ((repo (ewoc-data node))
+         (rel-path (sm--repo-info->rel-path repo))
+         (dir (expand-file-name rel-path (sm--root-dir))))
+    (if (not (sm--repo-info->detached-head? repo))
+        (if callback
+            (funcall callback rel-path "not a detached HEAD")
+          (user-error "%s is not a detached HEAD" rel-path))
+      (let* ((branches (sm--branches-containing-head dir))
+             (branch (pcase branches
+                       ('() (if callback
+                                (funcall callback rel-path
+                                         "no branch contains this commit")
+                              (user-error "No branch contains this commit")))
+                       (`(,b) b)
+                       (_ (completing-read
+                           (format "Attach %s to branch: " rel-path)
+                           branches nil t)))))
+        (when branch
+          (sm--run-git-on-node
+           node "sm-attach" "attaching" (list "checkout" branch)
+           (lambda ()
+             (setf (sm--repo-info->commit repo) (sm--head-commit)
+                   (sm--repo-info->branch repo) branch
+                   (sm--repo-info->detached-head? repo) nil))
+           (format "Attached %s to %s" rel-path branch)
+           callback))))))
 
 (defun sm-branch-attach ()
-  "Check out a branch containing HEAD for the (detached) repo at point or
-marked repos."
+  "Attach detached HEADs to a branch for marked repos or repo at point."
   (interactive)
-  (if-let (marked-nodes (sm--get-marked-ewoc-nodes))
-      (dolist (node marked-nodes)
-        (sm--branch-attach-internal node))
-    (sm--branch-attach-internal (ewoc-locate sm--ewoc))))
+  (sm--do-nodes-dwim "attached" #'sm--branch-attach-internal))
 
 (defun sm--repo-info:status-msg (repo)
   "Return appropriate status message for REPO."
-  (if (sm--repo-info->detached-head? repo)
-      "detached HEAD"
-    (pcase-exhaustive (cons (sm--repo-info->unpulled-changes? repo)
-                            (sm--repo-info->uncommitted-changes? repo))
-      ('(nil) "up to date")
-      ('(t) "unpulled changes")
-      ('(nil . t) "uncommitted changes")
-      ('(t . t) "unpulled & uncommitted changes"))))
+  (if-let ((label (sm--dir-busy-label
+                   (expand-file-name (sm--repo-info->rel-path repo)
+                                     (sm--root-dir)))))
+      (concat label "...")
+    (if (sm--repo-info->detached-head? repo)
+        "detached HEAD"
+      (pcase-exhaustive (cons (sm--repo-info->unpulled-changes? repo)
+                              (sm--repo-info->uncommitted-changes? repo))
+        ('(nil) "up to date")
+        ('(t) "unpulled changes")
+        ('(nil . t) "uncommitted changes")
+        ('(t . t) "unpulled & uncommitted changes")))))
 
-;; (let ((repo-info (sm-create-repo-info "foo" "ae41jlsk" "feature-1" nil :up-to-date)))
-;;   (sm--repo-info:status-msg repo-info))
-;;=> "up to date"
+(defun sm--repo-status-face (repo)
+  (cond
+   ((sm--dir-busy-label (expand-file-name (sm--repo-info->rel-path repo)
+                                          (sm--root-dir)))
+    'sm-status-busy-face)
+   ((or (sm--repo-info->unpulled-changes? repo)
+        (sm--repo-info->uncommitted-changes? repo))
+    'sm-status-attention-face)
+   (t 'sm-status-ok-face)))
 
 (defvar-local sm--column-widths nil
   "Cons of (PATH-WIDTH . CHECKOUT-WIDTH) for aligning entries.")
@@ -373,28 +596,58 @@ marked repos."
 
 (defun sm-headers ()
   "Display the headers *SM* buffer."
-  (concat
-   (mapconcat
-    (pcase-lambda (`(,cmd . ,desc))
-      (let ((key (where-is-internal cmd sm-mode-map t)))
-        (concat (propertize (if key (key-description key) "M-x")
-                            'face 'help-key-binding)
-                " " desc)))
-    '((sm-mark          . "mark")
-      (sm-unmark        . "unmark")
-      (sm-refresh       . "refresh")
-      (sm-vc-dir        . "vc-dir")
-      (sm-branch-switch . "switch branch")
-      (sm-branch-attach . "attach branch")
-      (sm-mark-all      . "mark all")
-      (sm-unmark-all    . "unmark all"))
-    "  ")
-   "\n\n"
-   (propertize (format "%s" (sm--project-root-name)) 'face 'sm-header)))
+  (cl-flet ((render-row (cmds)
+              (mapconcat
+               (pcase-lambda (`(,cmd . ,desc))
+                 (let ((key (where-is-internal cmd sm-mode-map t)))
+                   (concat (propertize (if key (key-description key) "M-x")
+                                       'face 'help-key-binding)
+                           " " desc)))
+               cmds
+               "  ")))
+    (concat
+     (render-row '((sm-mark               . "mark")
+                   (sm-unmark             . "unmark")
+                   (sm-mark-all           . "mark all")
+                   (sm-unmark-all         . "unmark all")
+                   (sm-refresh            . "refresh")
+                   (sm-pull               . "pull")
+                   (sm-push               . "push")))
+     "\n"
+     (render-row '((sm-vc-dir             . "vc-dir")
+                   (sm-branch-switch-dwim . "switch branch (dwim)")
+                   (sm-branch-switch      . "switch branch")
+                   (sm-branch-new-dwim         . "new branch (dwim)")
+                   (sm-branch-new         . "new branch")
+                   (sm-branch-attach      . "attach branch")))
+     "\n\n"
+     (propertize (format "%s" (sm--project-root-name)) 'face 'sm-header))))
+
+(defvar sm--processes nil
+  "Alist of (DIR PROC LABEL) for in-flight sm git operations.
+LABEL is a short present-participle string like \"pulling\".")
+
+(defun sm--prune-processes ()
+  "Drop dead processes from `sm--processes'."
+  (setq sm--processes
+        (cl-delete-if-not (lambda (entry) (process-live-p (nth 1 entry)))
+                          sm--processes)))
+
+(defun sm--dir-busy-label (dir)
+  "Return the busy LABEL for DIR, or nil if no operation is in flight."
+  (nth 2 (sm--dir-busy-p dir)))
+
+(defun sm--dir-busy-p (dir)
+  "Return non-nil if a git operation is in flight in DIR."
+  (sm--prune-processes)
+  (assoc dir sm--processes))
 
 (defun sm--busy ()
-  "TODO"
-  nil)
+  "Return non-nil if any operation is in flight under this project's root."
+  (sm--prune-processes)
+  (let ((root (expand-file-name (sm--root-dir))))
+    (cl-some (lambda (entry) (string-prefix-p root (car entry)))
+             sm--processes)))
 
 (defun sm--git-submodule-lines ()
   "Return output lines of `git submodule status --recursive'."
@@ -409,25 +662,11 @@ Applies to git repo rooted at DIR."
          (process-lines vc-git-program "rev-list" "-1" "HEAD..@{upstream}")
          t)))
 
-;; git rev-list -1 HEAD..origin/foobranch
-
-
 (defun sm--uncommitted-changes-p (dir)
   "Return t if remote has unpulled changes, else NIL.
 Applies to git repo rooted at DIR."
   (let ((default-directory dir))
     (and (process-lines vc-git-program "status" "--porcelain") t)))
-
-
-;; (sm--uncommitted-changes-p "~/code/watch_n_draw_build/Splice-Lang")
-;; ;;=> t
-;; (sm--uncommitted-changes-p "~/code/watch_n_draw_build/directory-slideshow")
-;; ;;=> nil
-;; (sm--unpulled-changes-p "~/code/watch_n_draw_build/watchndraw" "main")
-;; ;;=> t
-;; (sm--unpulled-changes-p "~/code/watch_n_draw_build/word_ladders" "main")
-;; ;;=> nil
-
 
 (defun sm--git-current-branch (dir)
   "Return (BRANCH . DETACHED-HEAD?) for repo DIR.
@@ -436,43 +675,6 @@ BRANCH is nil when HEAD is detached."
     (pcase (process-lines-ignore-status vc-git-program "branch" "--show-current")
       (`(,branch) (cons branch nil))
       ('() (cons nil t)))))
-
-;; (sm--git-current-branch "~/code/watch_n_draw_build/Splice-Lang/")
-;;=> ("main")
-
-;;=> ("main")
-
-;;=> (nil)
-
-;;=> (nil)
-
-;;=> (nil)
-
-;; (sm--git-current-branch "~/code/watch_n_draw_build/watchndraw/")
-;;=> (nil . t)
-
-;;=> ("main" . t)
-
-;;=> ("(HEAD detached at 667d148)" . t)
-
-;;=> ("(HEAD detached at 667d148)" . t)
-
-;;=> ("(HEAD detached at 667d148)" . t)
-
-;;=> (nil . t)
-
-;;=> ("main" . t)
-
-;; (sm--git-current-branch "~/code/watch_n_draw_build/directory-slideshow/")
-;;=> (nil . t)
-
-;;=> ("foobranch" . t)
-
-;;=> ("(HEAD detached at 647df9d)" . t)
-
-;;=> (nil . t)
-
-;;=> ("main" . t)
 
 (defun sm--project-get-repos ()
   "Return a list of `sm--repo-info's for each git submodule, recursively."
@@ -490,9 +692,6 @@ BRANCH is nil when HEAD is detached."
                             unpulled-changes?
                             uncommitted-changes?)))
    (sm--git-submodule-lines)))
-;; (let ((default-directory "~/code/watch_n_draw_build/"))
-;;   (sm--project-get-repos))
-;;=> (("watchndraw" "667d148d" "main" t :up-to-date nil))
 
 (defun sm-refresh ()
   "Refresh the contents of the *SM* buffer.
@@ -516,10 +715,15 @@ BRANCH is nil when HEAD is detached."
     (define-key map "u" #'sm-unmark)
     (define-key map "U" #'sm-unmark-all)
     (define-key map "g" #'sm-refresh)
+    (define-key map "+" #'sm-pull)
+    (define-key map "P" #'sm-push)
     (define-key map (kbd "RET") #'sm-vc-dir)
     (let ((branch-map (make-sparse-keymap)))
       (define-key map "b" branch-map)
-      (define-key branch-map "s" #'sm-branch-switch)
+      (define-key branch-map "s" #'sm-branch-switch-dwim)
+      (define-key branch-map "S" #'sm-branch-switch)
+      (define-key branch-map "n" #'sm-branch-new-dwim)
+      (define-key branch-map "N" #'sm-branch-new)
       (define-key branch-map "a" #'sm-branch-attach))
     map)
   "Keymap for directory buffer.")
@@ -530,7 +734,7 @@ BRANCH is nil when HEAD is detached."
   (let ((buffer-read-only nil))
     (erase-buffer)
     (setq-local sm--ewoc (ewoc-create #'sm--repo-render))
-    ;; (setq-local revert-buffer-function 'vc-dir-revert-buffer-function)
+    ;; TODO? (setq-local revert-buffer-function 'sm-revert-buffer-function)
     (setq list-buffers-directory (expand-file-name "*sm*" default-directory))
     (hack-dir-local-variables-non-file-buffer)
     (cl-pushnew (current-buffer) sm--buffers)
