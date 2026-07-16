@@ -585,7 +585,7 @@ the entry's status while the operation runs (e.g. \"pulling\").  ..."
 
 (defun sm--root-dir ()
   "Return VC root of `default-directory', or nil."
-  (when-let ((backend (vc-responsible-backend default-directory t)))
+  (when-let ((backend (vc-responsible-backend default-directory)))
     (vc-call-backend backend 'root default-directory)))
 
 (defun sm--project-root-name ()
@@ -672,7 +672,7 @@ Applies to git repo rooted at DIR."
   "Return (BRANCH . DETACHED-HEAD?) for repo DIR.
 BRANCH is nil when HEAD is detached."
   (let ((default-directory dir))
-    (pcase (process-lines-ignore-status vc-git-program "branch" "--show-current")
+    (pcase (process-lines vc-git-program "branch" "--show-current")
       (`(,branch) (cons branch nil))
       ('() (cons nil t)))))
 
