@@ -5,7 +5,7 @@
 ;; URL: https://github.com/Duncan-Britt/sm.el
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "26.0"))
-;; Keywords: vc
+;; Keywords: vc, tools
 
 ;; This file is NOT part of GNU Emacs.
 
@@ -302,12 +302,18 @@ name in all of them."
                                 (sm--root-dir))))
     (vc-dir dir)))
 
-(defun sm--repo-at-point ()
-  "Return the `sm--repo-info' for the entry at point, or signal an error."
-  (let ((node (ewoc-locate sm--ewoc)))
-    (unless node
-      (user-error "No repo at point"))
-    (ewoc-data node)))
+(defun sm--repo-at-point (&optional pos)
+  "Return the `sm--repo-info' for the entry at point or POS."
+  (let* ((pos (or pos (point)))
+         (node (ewoc-locate sm--ewoc pos)))
+    (when (and node
+               ;; point in header => locate returns first node,
+               ;; but pos is before it
+               (>= pos (ewoc-location node))
+               ;; point in footer => locate returns last node,
+               ;; but pos is at/after the footer start
+               (< pos (ewoc-location (ewoc--footer sm--ewoc))))
+      (ewoc-data node))))
 
 (defconst sm--log-buffer "*sm-log*"
   "Name of the buffer logging failed sm operations.")
@@ -595,7 +601,7 @@ the entry's status while the operation runs (e.g. \"pulling\").  ..."
     (user-error "directory not under source control: %s" default-directory)))
 
 (defun sm-headers ()
-  "Display the headers *SM* buffer."
+  "Render the headers of the *SM* buffer."
   (cl-flet ((render-row (cmds)
               (mapconcat
                (pcase-lambda (`(,cmd . ,desc))
