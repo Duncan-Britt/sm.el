@@ -297,9 +297,9 @@ name in all of them."
 (defun sm-vc-dir ()
   "Open the repo at point in `vc-dir'."
   (interactive)
-  (let* ((repo (sm--repo-at-point))
-         (dir (expand-file-name (sm--repo-info->rel-path repo)
-                                (sm--root-dir))))
+  (when-let* ((repo (sm--repo-at-point))
+              (dir (expand-file-name (sm--repo-info->rel-path repo)
+                                     (sm--root-dir))))
     (vc-dir dir)))
 
 (defun sm--repo-at-point (&optional pos)
