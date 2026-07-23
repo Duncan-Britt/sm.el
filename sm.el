@@ -112,6 +112,7 @@ Elements of ALIST that are not conses are ignored."
                  unpulled-changes?
                  uncommitted-changes?
                  unpushed-changes?
+                 stashed-changes?
                  &optional marked?))
                (:conc-name sm--repo-info->))
   rel-path
@@ -121,6 +122,7 @@ Elements of ALIST that are not conses are ignored."
   unpulled-changes?
   uncommitted-changes?
   unpushed-changes?
+  stashed-changes?
   marked?)
 
 (defun sm--mark-internal (node)
@@ -349,30 +351,33 @@ name in all of them."
        (format "Pulled %s" rel-path)
        callback))))
 
+(defun sm--do-nodes (nodes verb operation)
+  "Run async OPERATION on each of NODES, summarizing results with VERB.
+OPERATION is called with (NODE CALLBACK); CALLBACK must eventually be
+called with (REL-PATH ERROR-STRING-OR-NIL)."
+  (let ((total (length nodes))
+        (pending (length nodes))
+        (failed 0))
+    (dolist (node nodes)
+      (funcall operation node
+               (lambda (rel-path err)
+                 (when err
+                   (cl-incf failed)
+                   (sm--log-failure verb rel-path err))
+                 (cl-decf pending)
+                 (when (zerop pending)
+                   (if (zerop failed)
+                       (message "%s %d repos" (capitalize verb) total)
+                     (message "%s %d repos, %d failed (see %s)"
+                              (capitalize verb) (- total failed)
+                              failed sm--log-buffer)
+                     (pop-to-buffer sm--log-buffer))))))))
+
 (defun sm--do-nodes-dwim (verb operation)
   "Run OPERATION on marked nodes, or the node at point.
-OPERATION is called with (NODE CALLBACK), where CALLBACK must
-eventually be called with (REL-PATH ERROR-STRING-OR-NIL).  When
-operating on marked nodes, failures are logged to `sm--log-buffer'
-and a single summary is messaged using VERB (e.g. \"pulled\")."
+See `sm--do-nodes' for the OPERATION calling convention."
   (if-let (marked-nodes (sm--get-marked-ewoc-nodes))
-      (let ((total (length marked-nodes))
-            (pending (length marked-nodes))
-            (failed 0))
-        (dolist (node marked-nodes)
-          (funcall operation node
-                   (lambda (rel-path err)
-                     (when err
-                       (cl-incf failed)
-                       (sm--log-failure verb rel-path err))
-                     (cl-decf pending)
-                     (when (zerop pending)
-                       (if (zerop failed)
-                           (message "%s %d repos" (capitalize verb) total)
-                         (message "%s %d repos, %d failed (see %s)"
-                                  (capitalize verb) (- total failed)
-                                  failed sm--log-buffer)
-                         (pop-to-buffer sm--log-buffer)))))))
+      (sm--do-nodes marked-nodes verb operation)
     (funcall operation (ewoc-locate sm--ewoc) nil)))
 
 (defun sm-pull ()
@@ -380,24 +385,171 @@ and a single summary is messaged using VERB (e.g. \"pulled\")."
   (interactive)
   (sm--do-nodes-dwim "pulled" #'sm--pull-repo))
 
+(defun sm--upstream-exists-p (dir)
+  "Return non-nil if the repo at DIR has an upstream branch configured."
+  (let ((default-directory dir))
+    (zerop (call-process vc-git-program nil nil nil
+                         "rev-parse" "--verify" "--quiet" "@{upstream}"))))
+
 (defun sm--push-repo (node &optional callback)
   "Asynchronously push the repo at ewoc NODE and update UI when done."
   (let* ((repo (ewoc-data node))
-         (rel-path (sm--repo-info->rel-path repo)))
-    (if (sm--repo-info->detached-head? repo)
+         (rel-path (sm--repo-info->rel-path repo))
+         (dir (expand-file-name rel-path (sm--root-dir))))
+    (cond
+     ((sm--repo-info->detached-head? repo)
+      (if callback
+          (funcall callback rel-path "detached HEAD")
+        (user-error "Cannot push %s: detached HEAD" rel-path)))
+     ((not (sm--upstream-exists-p dir))
+      (if (y-or-n-p (format "%s has no upstream.  Push with --set-upstream? "
+                            rel-path))
+          (sm--run-git-on-node
+           node "sm-push" "pushing"
+           (list "push" "--set-upstream" "origin"
+                 (sm--repo-info->branch repo))
+           (lambda ()
+             (setf (sm--repo-info->unpushed-changes? repo) nil))
+           (format "Pushed %s (upstream set)" rel-path)
+           callback)
         (if callback
-            (funcall callback rel-path "detached HEAD")
-          (user-error "Cannot push %s: detached HEAD" rel-path))
+            (funcall callback rel-path "no upstream; user declined")
+          (message "Push of %s cancelled" rel-path))))
+     (t
       (sm--run-git-on-node
        node "sm-push" "pushing" '("push")
-       #'ignore
+       (lambda ()
+         (setf (sm--repo-info->unpushed-changes? repo) nil))
        (format "Pushed %s" rel-path)
-       callback))))
+       callback)))))
 
 (defun sm-push ()
   "Push marked repos or repo at point."
   (interactive)
   (sm--do-nodes-dwim "pushed" #'sm--push-repo))
+
+(defun sm--stash-repo (node &optional callback)
+  "Asynchronously stash changes in the repo at ewoc NODE."
+  (let* ((repo (ewoc-data node))
+         (rel-path (sm--repo-info->rel-path repo))
+         (dir (expand-file-name rel-path (sm--root-dir))))
+    (if (not (sm--repo-info->uncommitted-changes? repo))
+        (if callback
+            (funcall callback rel-path "no local changes to stash")
+          (user-error "%s: no local changes to stash" rel-path))
+      (sm--run-git-on-node
+       node "sm-stash" "stashing" '("stash" "push")
+       (lambda ()
+         (setf (sm--repo-info->uncommitted-changes? repo) nil
+               (sm--repo-info->stashed-changes? repo) t))
+       (format "Stashed changes in %s" rel-path)
+       callback))))
+
+(defun sm-stash ()
+  "Stash changes in marked repos or repo at point."
+  (interactive)
+  (sm--do-nodes-dwim "stashed" #'sm--stash-repo))
+
+(defun sm--stash-pop-repo (node &optional callback)
+  "Asynchronously pop the stash in the repo at ewoc NODE."
+  (let* ((repo (ewoc-data node))
+         (rel-path (sm--repo-info->rel-path repo))
+         (dir (expand-file-name rel-path (sm--root-dir))))
+    (if (not (sm--repo-info->stashed-changes? repo))
+        (if callback
+            (funcall callback rel-path "no stash entries")
+          (user-error "%s: no stash entries" rel-path))
+      (sm--run-git-on-node
+       node "sm-stash-pop" "popping stash" '("stash" "pop")
+       (lambda ()
+         (setf (sm--repo-info->uncommitted-changes? repo)
+               (sm--uncommitted-changes-p dir)
+               (sm--repo-info->stashed-changes? repo)
+               (sm--stashed-changes-p dir)))
+       (format "Popped stash in %s" rel-path)
+       callback))))
+
+(defun sm-stash-pop ()
+  "Pop the stash in marked repos or repo at point."
+  (interactive)
+  (sm--do-nodes-dwim "popped stash in" #'sm--stash-pop-repo))
+
+(defconst sm--commit-diff-buffer "*sm-commit-diff*"
+  "Name of the buffer showing staged diffs before committing.")
+
+(defun sm--stage-all (dir)
+  "Register untracked files and stage all changes in DIR."
+  (let ((default-directory dir))
+    (unless (zerop (call-process vc-git-program nil nil nil "add" "-A"))
+      (error "git add -A failed in %s" dir))))
+
+(defun sm--show-staged-diffs (repos)
+  "Show a combined diff of staged changes for REPOS in a diff buffer."
+  (let ((root (sm--root-dir))
+        (buf (get-buffer-create sm--commit-diff-buffer)))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (dolist (repo repos)
+          (let* ((rel-path (sm--repo-info->rel-path repo))
+                 (default-directory (expand-file-name rel-path root)))
+            (insert (propertize (format "=== %s ===\n" rel-path)
+                                'face 'sm-repo-path-face))
+            (call-process vc-git-program nil t nil "diff" "--cached")
+            (insert "\n")))
+        (goto-char (point-min))
+        (diff-mode)
+        (setq buffer-read-only t)))
+    (display-buffer buf)))
+
+(defun sm--commit-repo (node message &optional callback)
+  "Asynchronously commit staged changes in the repo at ewoc NODE.
+MESSAGE is the commit message."
+  (let* ((repo (ewoc-data node))
+         (rel-path (sm--repo-info->rel-path repo))
+         (dir (expand-file-name rel-path (sm--root-dir))))
+    (sm--run-git-on-node
+     node "sm-commit" "committing" (list "commit" "-m" message)
+     (lambda ()
+       (setf (sm--repo-info->commit repo) (sm--head-commit)
+             (sm--repo-info->uncommitted-changes? repo) nil
+             (sm--repo-info->unpushed-changes? repo)
+             (sm--unpushed-changes-p dir)))
+     (format "Committed %s" rel-path)
+     callback)))
+
+(defun sm-commit-dwim ()
+  "Commit all changes in marked repos (or repo at point) with one message.
+Registers untracked files and stages all changes first, shows the
+combined staged diffs, then prompts for a single commit message used
+for every repo that has changes to commit."
+  (interactive)
+  (let* ((nodes (or (sm--get-marked-ewoc-nodes)
+                    (when-let ((node (ewoc-locate sm--ewoc)))
+                      (list node))))
+         (dirty-nodes
+          (cl-remove-if-not
+           (lambda (node)
+             (sm--repo-info->uncommitted-changes? (ewoc-data node)))
+           nodes)))
+    (unless dirty-nodes
+      (user-error "No uncommitted changes in %s"
+                  (if (cdr nodes) "marked repos" "repo at point")))
+    ;; Stage everything synchronously so the diff reflects what will
+    ;; be committed.
+    (dolist (node dirty-nodes)
+      (sm--stage-all (expand-file-name
+                      (sm--repo-info->rel-path (ewoc-data node))
+                      (sm--root-dir))))
+    (sm--show-staged-diffs (mapcar #'ewoc-data dirty-nodes))
+    (let ((message (read-string
+                    (format "Commit message for %d repo(s): "
+                            (length dirty-nodes)))))
+      (when (string-empty-p message)
+        (user-error "Empty commit message"))
+      (sm--do-nodes dirty-nodes "committed"
+                    (lambda (node cb)
+                      (sm--commit-repo node message cb))))))
 
 (defvar sm--buffers nil "List of sm-mode buffers.")
 
@@ -544,7 +696,9 @@ the entry's status while the operation runs (e.g. \"pulling\").  ..."
                                (and (sm--repo-info->uncommitted-changes? repo)
                                     "uncommitted")
                                (and (sm--repo-info->unpushed-changes? repo)
-                                    "unpushed")))))
+                                    "unpushed")
+                               (and (sm--repo-info->stashed-changes? repo)
+                                    "stashed")))))
         (if parts
             (concat (mapconcat #'identity parts " & ") " changes")
           "up to date")))))
@@ -626,14 +780,18 @@ the entry's status while the operation runs (e.g. \"pulling\").  ..."
                    (sm-unmark-all         . "unmark all")
                    (sm-refresh            . "refresh")
                    (sm-pull               . "pull")
-                   (sm-push               . "push")))
+                   (sm-push               . "push")
+                   (sm-commit-dwim        . "commit")))
      "\n"
      (render-row '((sm-vc-dir             . "vc-dir")
                    (sm-branch-switch-dwim . "switch branch (dwim)")
                    (sm-branch-switch      . "switch branch")
-                   (sm-branch-new-dwim         . "new branch (dwim)")
+                   (sm-branch-new-dwim    . "new branch (dwim)")
                    (sm-branch-new         . "new branch")
                    (sm-branch-attach      . "attach branch")))
+     "\n"
+     (render-row '((sm-stash . "stash")
+                   (sm-stash-pop . "pop stash")))
      "\n\n"
      (propertize (format "%s" (sm--project-root-name)) 'face 'sm-header))))
 
@@ -676,6 +834,14 @@ Applies to git repo rooted at DIR."
          (process-lines vc-git-program "rev-list" "-1" "HEAD..@{upstream}")
          t)))
 
+(defun sm--stashed-changes-p (dir)
+  "Return t if the repo at DIR has stashed changes, else nil."
+  (let ((default-directory dir))
+    (and (zerop (call-process vc-git-program nil nil nil
+                              "rev-parse" "--verify" "--quiet" "refs/stash"))
+         t)))
+;; (sm--stashed-changes-p (expand-file-name "../sm.el-dev/"))
+
 (defun sm--uncommitted-changes-p (dir)
   "Return t if remote has unpulled changes, else NIL.
 Applies to git repo rooted at DIR."
@@ -707,14 +873,16 @@ BRANCH is nil when HEAD is detached."
                   (`(,branch . ,detached-head?) (sm--git-current-branch dir))
                   (unpulled-changes? (and (not detached-head?) (sm--unpulled-changes-p dir branch)))
                   (uncommitted-changes? (sm--uncommitted-changes-p dir))
-                  (unpushed-changes? (sm--unpushed-changes-p dir)))
+                  (unpushed-changes? (sm--unpushed-changes-p dir))
+                  (stashed-changes? (sm--stashed-changes-p dir)))
        (sm-create-repo-info rel-path
                             (substring commit 0 8)
                             branch
                             detached-head?
                             unpulled-changes?
                             uncommitted-changes?
-                            unpushed-changes?)))
+                            unpushed-changes?
+                            stashed-changes?)))
    (sm--git-submodule-lines)))
 
 (defun sm-refresh ()
@@ -742,6 +910,7 @@ BRANCH is nil when HEAD is detached."
     (define-key map "+" #'sm-pull)
     (define-key map "P" #'sm-push)
     (define-key map (kbd "RET") #'sm-vc-dir)
+    (define-key map "c" #'sm-commit-dwim)
     (let ((branch-map (make-sparse-keymap)))
       (define-key map "b" branch-map)
       (define-key branch-map "s" #'sm-branch-switch-dwim)
@@ -749,6 +918,10 @@ BRANCH is nil when HEAD is detached."
       (define-key branch-map "n" #'sm-branch-new-dwim)
       (define-key branch-map "N" #'sm-branch-new)
       (define-key branch-map "a" #'sm-branch-attach))
+    (let ((stash-map (make-sparse-keymap)))
+      (define-key map "s" stash-map)
+      (define-key stash-map "s" #'sm-stash)
+      (define-key stash-map "p" #'sm-stash-pop))
     map)
   "Keymap for directory buffer.")
 
