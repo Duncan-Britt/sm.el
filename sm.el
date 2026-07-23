@@ -35,25 +35,6 @@
 (require 'vc)
 (require 'vc-git)
 
-(defun sm--assoc-delete-all (key alist &optional test)
-  "Delete from ALIST all elements whose car is KEY.
-Compare keys with TEST.  Defaults to `equal'.
-Return the modified alist.
-Elements of ALIST that are not conses are ignored."
-  (if (fboundp 'assoc-delete-all)
-      (assoc-delete-all key alist test)
-    (unless test (setq test #'equal))
-    (while (and (consp (car alist))
-                (funcall test (caar alist) key))
-      (setq alist (cdr alist)))
-    (let ((tail alist) tail-cdr)
-      (while (setq tail-cdr (cdr tail))
-        (if (and (consp (car tail-cdr))
-                 (funcall test (caar tail-cdr) key))
-            (setcdr tail (cdr tail-cdr))
-          (setq tail tail-cdr))))
-    alist))
-
 (defgroup sm nil
   "Simple UI for managing git submodules."
   :group 'vc)
@@ -100,6 +81,9 @@ Elements of ALIST that are not conses are ignored."
 
 (defvar sm--ewoc nil)
 
+(defconst sm--log-buffer "*sm-log*"
+  "Name of the buffer logging failed sm operations.")
+
 (cl-defstruct (sm--repo-info
                (:copier nil)
                (:type list)
@@ -124,6 +108,25 @@ Elements of ALIST that are not conses are ignored."
   unpushed-changes?
   stashed-changes?
   marked?)
+
+(defun sm--assoc-delete-all (key alist &optional test)
+  "Delete from ALIST all elements whose car is KEY.
+Compare keys with TEST.  Defaults to `equal'.
+Return the modified alist.
+Elements of ALIST that are not conses are ignored."
+  (if (fboundp 'assoc-delete-all)
+      (assoc-delete-all key alist test)
+    (unless test (setq test #'equal))
+    (while (and (consp (car alist))
+                (funcall test (caar alist) key))
+      (setq alist (cdr alist)))
+    (let ((tail alist) tail-cdr)
+      (while (setq tail-cdr (cdr tail))
+        (if (and (consp (car tail-cdr))
+                 (funcall test (caar tail-cdr) key))
+            (setcdr tail (cdr tail-cdr))
+          (setq tail tail-cdr))))
+    alist))
 
 (defun sm--mark-internal (node)
   "Mark ewoc NODE."
@@ -320,9 +323,6 @@ name in all of them."
                (< pos (ewoc-location (ewoc--footer sm--ewoc))))
       (ewoc-data node))))
 
-(defconst sm--log-buffer "*sm-log*"
-  "Name of the buffer logging failed sm operations.")
-
 (defun sm--log-failure (operation rel-path err)
   "Append OPERATION failure ERR for REL-PATH to `sm--log-buffer'."
   (with-current-buffer (get-buffer-create sm--log-buffer)
@@ -431,8 +431,7 @@ See `sm--do-nodes' for the OPERATION calling convention."
 (defun sm--stash-repo (node &optional callback)
   "Asynchronously stash changes in the repo at ewoc NODE."
   (let* ((repo (ewoc-data node))
-         (rel-path (sm--repo-info->rel-path repo))
-         (dir (expand-file-name rel-path (sm--root-dir))))
+         (rel-path (sm--repo-info->rel-path repo)))
     (if (not (sm--repo-info->uncommitted-changes? repo))
         (if callback
             (funcall callback rel-path "no local changes to stash")
@@ -474,9 +473,6 @@ See `sm--do-nodes' for the OPERATION calling convention."
   (interactive)
   (sm--do-nodes-dwim "popped stash in" #'sm--stash-pop-repo))
 
-(defconst sm--commit-diff-buffer "*sm-commit-diff*"
-  "Name of the buffer showing staged diffs before committing.")
-
 (defun sm--stage-all (dir)
   "Register untracked files and stage all changes in DIR."
   (let ((default-directory dir))
@@ -484,7 +480,8 @@ See `sm--do-nodes' for the OPERATION calling convention."
       (error "git add -A failed in %s" dir))))
 
 (defun sm--show-staged-diffs (repos)
-  "Show a combined diff of staged changes for REPOS in a diff buffer."
+  "Return a buffer containing the combined staged diffs for REPOS.
+The buffer is not displayed."
   (let ((root (sm--root-dir))
         (buf (get-buffer-create sm--commit-diff-buffer)))
     (with-current-buffer buf
@@ -500,7 +497,103 @@ See `sm--do-nodes' for the OPERATION calling convention."
         (goto-char (point-min))
         (diff-mode)
         (setq buffer-read-only t)))
-    (display-buffer buf)))
+    buf))
+
+(defconst sm--commit-diff-buffer "*sm-commit-diff*"
+  "Name of the buffer showing staged diffs before committing.")
+
+(defconst sm--commit-message-buffer "*sm-commit-message*"
+  "Name of the buffer for composing commit messages.")
+
+(defvar-local sm--commit-pending-nodes nil
+  "Ewoc nodes to commit when the message is finished.")
+
+(defvar-local sm--commit-source-buffer nil
+  "The sm buffer that initiated the commit.")
+
+(defvar-local sm--commit-window-config nil
+  "Window configuration to restore after committing or aborting.")
+
+(defvar sm-commit-message-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'sm-commit-finish)
+    (define-key map (kbd "C-c C-k") #'sm-commit-abort)
+    map)
+  "Keymap for `sm-commit-message-mode'.")
+
+(define-derived-mode sm-commit-message-mode text-mode "SM-Commit"
+  "Major mode for composing a commit message for sm repos.
+\\{sm-commit-message-mode-map}"
+  (setq-local fill-column 72)
+  (setq-local comment-start "#")
+  (setq-local comment-start-skip "#+\\s-*")
+  (setq-local font-lock-defaults
+              '((("^#.*$" . font-lock-comment-face)))))
+
+(defun sm--commit-message-string ()
+  "Return the commit message in the current buffer.
+Lines starting with `#' are stripped, and the result is trimmed."
+  (string-trim
+   (mapconcat #'identity
+              (cl-remove-if (lambda (line) (string-prefix-p "#" line))
+                            (split-string (buffer-string) "\n"))
+              "\n")))
+
+(defun sm--commit-cleanup (winconf)
+  "Kill commit-related buffers and restore WINCONF."
+  (when-let ((diff-buf (get-buffer sm--commit-diff-buffer)))
+    (kill-buffer diff-buf))
+  (when-let ((msg-buf (get-buffer sm--commit-message-buffer)))
+    (kill-buffer msg-buf))
+  (when winconf
+    (set-window-configuration winconf)))
+
+(defun sm-commit-finish ()
+  "Commit the staged changes in all pending repos with the current message."
+  (interactive)
+  (let ((message (sm--commit-message-string))
+        (nodes sm--commit-pending-nodes)
+        (sm-buf sm--commit-source-buffer)
+        (winconf sm--commit-window-config))
+    (when (string-empty-p message)
+      (user-error "Empty commit message"))
+    (unless (buffer-live-p sm-buf)
+      (user-error "The originating sm buffer no longer exists"))
+    (sm--commit-cleanup winconf)
+    (with-current-buffer sm-buf
+      (sm--do-nodes nodes "committed"
+                    (lambda (node cb)
+                      (sm--commit-repo node message cb))))))
+
+(defun sm-commit-abort ()
+  "Abort the commit.  Changes remain staged."
+  (interactive)
+  (sm--commit-cleanup sm--commit-window-config)
+  (message "Commit aborted (changes remain staged)"))
+
+(defun sm--commit-setup (dirty-nodes)
+  "Show staged diffs for DIRTY-NODES and open a commit message buffer."
+  (let ((sm-buf (current-buffer))
+        (winconf (current-window-configuration))
+        (msg-buf (get-buffer-create sm--commit-message-buffer))
+        (diff-buf (sm--show-staged-diffs (mapcar #'ewoc-data dirty-nodes))))
+    (with-current-buffer msg-buf
+      (erase-buffer)
+      (sm-commit-message-mode)
+      (setq sm--commit-pending-nodes dirty-nodes
+            sm--commit-source-buffer sm-buf
+            sm--commit-window-config winconf)
+      (insert "\n\n# Committing to:\n")
+      (dolist (node dirty-nodes)
+        (insert (format "#   %s\n"
+                        (sm--repo-info->rel-path (ewoc-data node)))))
+      (insert "#\n"
+              "# Type C-c C-c to commit, C-c C-k to abort.\n"
+              "# Lines starting with '#' will be ignored.\n")
+      (goto-char (point-min)))
+    (pop-to-buffer msg-buf)
+    (delete-other-windows)
+    (set-window-buffer (split-window-right) diff-buf)))
 
 (defun sm--commit-repo (node message &optional callback)
   "Asynchronously commit staged changes in the repo at ewoc NODE.
@@ -521,8 +614,8 @@ MESSAGE is the commit message."
 (defun sm-commit-dwim ()
   "Commit all changes in marked repos (or repo at point) with one message.
 Registers untracked files and stages all changes first, shows the
-combined staged diffs, then prompts for a single commit message used
-for every repo that has changes to commit."
+combined staged diffs, then opens a commit message buffer.  Finish
+with \\<sm-commit-message-mode-map>\\[sm-commit-finish], abort with \\[sm-commit-abort]."
   (interactive)
   (let* ((nodes (or (sm--get-marked-ewoc-nodes)
                     (when-let ((node (ewoc-locate sm--ewoc)))
@@ -541,15 +634,7 @@ for every repo that has changes to commit."
       (sm--stage-all (expand-file-name
                       (sm--repo-info->rel-path (ewoc-data node))
                       (sm--root-dir))))
-    (sm--show-staged-diffs (mapcar #'ewoc-data dirty-nodes))
-    (let ((message (read-string
-                    (format "Commit message for %d repo(s): "
-                            (length dirty-nodes)))))
-      (when (string-empty-p message)
-        (user-error "Empty commit message"))
-      (sm--do-nodes dirty-nodes "committed"
-                    (lambda (node cb)
-                      (sm--commit-repo node message cb))))))
+    (sm--commit-setup dirty-nodes)))
 
 (defvar sm--buffers nil "List of sm-mode buffers.")
 
@@ -825,7 +910,7 @@ LABEL is a short present-participle string like \"pulling\".")
   "Return output lines of `git submodule status --recursive'."
   (process-lines vc-git-program "submodule" "status" "--recursive"))
 
-(defun sm--unpulled-changes-p (dir branch)
+(defun sm--unpulled-changes-p (dir)
   "Return t if remote has unpulled changes, else NIL.
 Applies to git repo rooted at DIR."
   (let ((default-directory dir))
@@ -871,7 +956,7 @@ BRANCH is nil when HEAD is detached."
      (pcase-let* ((`(,commit ,rel-path) (split-string (substring line 1)))
                   (dir (expand-file-name rel-path (sm--root-dir)))
                   (`(,branch . ,detached-head?) (sm--git-current-branch dir))
-                  (unpulled-changes? (and (not detached-head?) (sm--unpulled-changes-p dir branch)))
+                  (unpulled-changes? (and (not detached-head?) (sm--unpulled-changes-p dir)))
                   (uncommitted-changes? (sm--uncommitted-changes-p dir))
                   (unpushed-changes? (sm--unpushed-changes-p dir))
                   (stashed-changes? (sm--stashed-changes-p dir)))
