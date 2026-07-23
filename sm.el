@@ -208,7 +208,7 @@ Elements of ALIST that are not conses are ignored."
              (sm--repo-info->branch repo) branch
              (sm--repo-info->detached-head? repo) nil
              (sm--repo-info->unpulled-changes? repo)
-             (sm--unpulled-changes-p dir branch)))
+             (sm--unpulled-changes-p dir)))
      (format "Switched %s to %s" rel-path branch)
      callback)))
 
