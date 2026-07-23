@@ -681,8 +681,6 @@ Applies to git repo rooted at DIR."
                               "rev-parse" "--verify" "--quiet" "@{upstream}"))
          (process-lines vc-git-program "rev-list" "-1" "@{upstream}..HEAD")
          t)))
-;; (sm--unpushed-changes-p "./")
-;;=> nil
 
 (defun sm--git-current-branch (dir)
   "Return (BRANCH . DETACHED-HEAD?) for repo DIR.
