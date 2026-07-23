@@ -137,7 +137,7 @@ Elements of ALIST that are not conses are ignored."
 (defun sm-mark ()
   "Mark the repo at point and move to the next entry."
   (interactive)
-  (let ((node (ewoc-locate sm--ewoc)))
+  (let ((node (sm--node-at-point)))
     (unless node
       (user-error "No repo at point"))
     (sm--mark-internal node)
@@ -153,7 +153,7 @@ Elements of ALIST that are not conses are ignored."
 (defun sm-unmark ()
   "Unmark the repo at point and move to the next entry."
   (interactive)
-  (let ((node (ewoc-locate sm--ewoc)))
+  (let ((node (sm--node-at-point)))
     (unless node
       (user-error "No repo at point"))
     (sm--unmark-internal node)
@@ -310,18 +310,19 @@ name in all of them."
                                      (sm--root-dir))))
     (vc-dir dir)))
 
-(defun sm--repo-at-point (&optional pos)
-  "Return the `sm--repo-info' for the entry at point or POS."
+(defun sm--node-at-point (&optional pos)
+  "Return the ewoc node at point or POS, or nil if in the header/footer."
   (let* ((pos (or pos (point)))
          (node (ewoc-locate sm--ewoc pos)))
     (when (and node
-               ;; point in header => locate returns first node,
-               ;; but pos is before it
                (>= pos (ewoc-location node))
-               ;; point in footer => locate returns last node,
-               ;; but pos is at/after the footer start
                (< pos (ewoc-location (ewoc--footer sm--ewoc))))
-      (ewoc-data node))))
+      node)))
+
+(defun sm--repo-at-point (&optional pos)
+  "Return the `sm--repo-info' for the entry at point or POS."
+  (when-let ((node (sm--node-at-point pos)))
+    (ewoc-data node)))
 
 (defun sm--log-failure (operation rel-path err)
   "Append OPERATION failure ERR for REL-PATH to `sm--log-buffer'."
@@ -378,7 +379,9 @@ called with (REL-PATH ERROR-STRING-OR-NIL)."
 See `sm--do-nodes' for the OPERATION calling convention."
   (if-let (marked-nodes (sm--get-marked-ewoc-nodes))
       (sm--do-nodes marked-nodes verb operation)
-    (funcall operation (ewoc-locate sm--ewoc) nil)))
+    (if-let ((node (sm--node-at-point)))
+        (funcall operation node nil)
+      (user-error "No repo at point"))))
 
 (defun sm-pull ()
   "Pull marked repos or repo at point."
@@ -618,13 +621,15 @@ combined staged diffs, then opens a commit message buffer.  Finish
 with \\<sm-commit-message-mode-map>\\[sm-commit-finish], abort with \\[sm-commit-abort]."
   (interactive)
   (let* ((nodes (or (sm--get-marked-ewoc-nodes)
-                    (when-let ((node (ewoc-locate sm--ewoc)))
+                    (when-let ((node (sm--node-at-point)))
                       (list node))))
          (dirty-nodes
           (cl-remove-if-not
            (lambda (node)
              (sm--repo-info->uncommitted-changes? (ewoc-data node)))
            nodes)))
+    (unless nodes
+      (user-error "No repo at point"))
     (unless dirty-nodes
       (user-error "No uncommitted changes in %s"
                   (if (cdr nodes) "marked repos" "repo at point")))
@@ -866,16 +871,16 @@ the entry's status while the operation runs (e.g. \"pulling\").  ..."
                    (sm-refresh            . "refresh")
                    (sm-pull               . "pull")
                    (sm-push               . "push")
-                   (sm-commit-dwim        . "commit")))
+                   (sm-commit-dwim        . "commit")
+                   (sm-vc-dir             . "vc-dir")))
      "\n"
-     (render-row '((sm-vc-dir             . "vc-dir")
-                   (sm-branch-switch-dwim . "switch branch (dwim)")
+     (render-row '((sm-branch-switch-dwim . "switch branch (dwim)")
                    (sm-branch-switch      . "switch branch")
-                   (sm-branch-new-dwim    . "new branch (dwim)")
-                   (sm-branch-new         . "new branch")
                    (sm-branch-attach      . "attach branch")))
      "\n"
-     (render-row '((sm-stash . "stash")
+     (render-row '((sm-branch-new-dwim    . "new branch (dwim)")
+                   (sm-branch-new         . "new branch")
+                   (sm-stash . "stash")
                    (sm-stash-pop . "pop stash")))
      "\n\n"
      (propertize (format "%s" (sm--project-root-name)) 'face 'sm-header))))
