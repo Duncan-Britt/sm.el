@@ -674,6 +674,16 @@ Applies to git repo rooted at DIR."
   (let ((default-directory dir))
     (and (process-lines vc-git-program "status" "--porcelain") t)))
 
+(defun sm--unpushed-changes-p (dir)
+  "Return t if DIR has commits ahead of its upstream branch, else nil."
+  (let ((default-directory dir))
+    (and (zerop (call-process vc-git-program nil nil nil
+                              "rev-parse" "--verify" "--quiet" "@{upstream}"))
+         (process-lines vc-git-program "rev-list" "-1" "@{upstream}..HEAD")
+         t)))
+;; (sm--unpushed-changes-p "./")
+;;=> nil
+
 (defun sm--git-current-branch (dir)
   "Return (BRANCH . DETACHED-HEAD?) for repo DIR.
 BRANCH is nil when HEAD is detached."
