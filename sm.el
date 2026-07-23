@@ -104,7 +104,15 @@ Elements of ALIST that are not conses are ignored."
                (:copier nil)
                (:type list)
                (:constructor
-                sm-create-repo-info (rel-path commit branch detached-head? unpulled-changes? uncommitted-changes? &optional marked?))
+                sm-create-repo-info
+                (rel-path
+                 commit
+                 branch
+                 detached-head?
+                 unpulled-changes?
+                 uncommitted-changes?
+                 unpushed-changes?
+                 &optional marked?))
                (:conc-name sm--repo-info->))
   rel-path
   commit
@@ -112,13 +120,8 @@ Elements of ALIST that are not conses are ignored."
   detached-head?
   unpulled-changes?
   uncommitted-changes?
+  unpushed-changes?
   marked?)
-
-(defun sm--repo-status-face (repo)
-  (if (or (sm--repo-info->unpulled-changes? repo)
-          (sm--repo-info->uncommitted-changes? repo))
-      'sm-status-attention-face
-    'sm-status-ok-face))
 
 (defun sm--mark-internal (node)
   "Mark ewoc NODE."
@@ -535,12 +538,16 @@ the entry's status while the operation runs (e.g. \"pulling\").  ..."
       (concat label "...")
     (if (sm--repo-info->detached-head? repo)
         "detached HEAD"
-      (pcase-exhaustive (cons (sm--repo-info->unpulled-changes? repo)
-                              (sm--repo-info->uncommitted-changes? repo))
-        ('(nil) "up to date")
-        ('(t) "unpulled changes")
-        ('(nil . t) "uncommitted changes")
-        ('(t . t) "unpulled & uncommitted changes")))))
+      (let ((parts (delq nil
+                         (list (and (sm--repo-info->unpulled-changes? repo)
+                                    "unpulled")
+                               (and (sm--repo-info->uncommitted-changes? repo)
+                                    "uncommitted")
+                               (and (sm--repo-info->unpushed-changes? repo)
+                                    "unpushed")))))
+        (if parts
+            (concat (mapconcat #'identity parts " & ") " changes")
+          "up to date")))))
 
 (defun sm--repo-status-face (repo)
   (cond
@@ -548,7 +555,8 @@ the entry's status while the operation runs (e.g. \"pulling\").  ..."
                                           (sm--root-dir)))
     'sm-status-busy-face)
    ((or (sm--repo-info->unpulled-changes? repo)
-        (sm--repo-info->uncommitted-changes? repo))
+        (sm--repo-info->uncommitted-changes? repo)
+        (sm--repo-info->unpushed-changes? repo))
     'sm-status-attention-face)
    (t 'sm-status-ok-face)))
 
@@ -698,13 +706,15 @@ BRANCH is nil when HEAD is detached."
                   (dir (expand-file-name rel-path (sm--root-dir)))
                   (`(,branch . ,detached-head?) (sm--git-current-branch dir))
                   (unpulled-changes? (and (not detached-head?) (sm--unpulled-changes-p dir branch)))
-                  (uncommitted-changes? (sm--uncommitted-changes-p dir)))
+                  (uncommitted-changes? (sm--uncommitted-changes-p dir))
+                  (unpushed-changes? (sm--unpushed-changes-p dir)))
        (sm-create-repo-info rel-path
                             (substring commit 0 8)
                             branch
                             detached-head?
                             unpulled-changes?
-                            uncommitted-changes?)))
+                            uncommitted-changes?
+                            unpushed-changes?)))
    (sm--git-submodule-lines)))
 
 (defun sm-refresh ()
