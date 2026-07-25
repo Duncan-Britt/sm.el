@@ -23,12 +23,8 @@
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
-;; Should you find yourself developing a software project composed of
-;; tightly coupled git submodules, sm.el (Sub-Module) is here to help
-;; you by providing visibility into the state of all your submodules
-;; and convenience to frequently used git commands, especially when
-;; you need to carry out the same action accross multiple git
-;; submodules.
+;; sm.el makes it easier to develop a codebase distributed among git
+;; repos which move in lockstep.
 
 ;;; Code:
 (require 'ewoc)
@@ -750,8 +746,10 @@ the entry's status while the operation runs (e.g. \"pulling\").  ..."
       (let* ((branches (sm--branches-containing-head dir))
              (branch (pcase branches
                        ('() (if callback
-                                (funcall callback rel-path
-                                         "no branch contains this commit")
+                                (progn
+                                  (funcall callback rel-path
+                                           "no branch contains this commit")
+                                  nil)
                               (user-error "No branch contains this commit")))
                        (`(,b) b)
                        (_ (completing-read
@@ -930,7 +928,6 @@ Applies to git repo rooted at DIR."
     (and (zerop (call-process vc-git-program nil nil nil
                               "rev-parse" "--verify" "--quiet" "refs/stash"))
          t)))
-;; (sm--stashed-changes-p (expand-file-name "../sm.el-dev/"))
 
 (defun sm--uncommitted-changes-p (dir)
   "Return t if remote has unpulled changes, else NIL.
@@ -950,7 +947,7 @@ Applies to git repo rooted at DIR."
   "Return (BRANCH . DETACHED-HEAD?) for repo DIR.
 BRANCH is nil when HEAD is detached."
   (let ((default-directory dir))
-    (pcase (process-lines vc-git-program "branch" "--show-current")
+    (pcase-exhaustive (process-lines vc-git-program "branch" "--show-current")
       (`(,branch) (cons branch nil))
       ('() (cons nil t)))))
 
