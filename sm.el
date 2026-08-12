@@ -37,6 +37,19 @@
   "Simple UI for managing git submodules."
   :group 'vc)
 
+(defcustom sm-exclude-paths nil
+  "List of regexps for paths to exclude from repo scanning.
+Each regexp is matched against a repo's path relative to the
+managed root directory.  Matching directories are skipped
+entirely, including any nested repos within them."
+  :type '(repeat regexp)
+  :group 'sm)
+
+(defun sm--excluded-path-p (rel-path)
+  "Return non-nil if REL-PATH matches an entry in `sm-exclude-paths'."
+  (cl-some (lambda (re) (string-match-p re rel-path))
+           sm-exclude-paths))
+
 (defface sm-header
   '((t :inherit vc-dir-header-value))
   "Face for the project name in the header."
@@ -914,16 +927,56 @@ LABEL is a short present-participle string like \"pulling\".")
     (cl-some (lambda (entry) (string-prefix-p root (car entry)))
              sm--processes)))
 
+;; (defun sm--scan-via-find (root)
+;;   "Return relative paths (from ROOT) of git repos under ROOT, using find."
+;;   (sort (cl-loop for path in (process-lines "find" (expand-file-name root)
+;;                                             "-name" ".git" "-prune" "-print")
+;;                  ;; "/root/foo/bar/.git" -> "foo/bar"
+;;                  for rel = (file-relative-name (file-name-directory path) root)
+;;                  unless (string= rel "./")   ; ROOT itself is a repo; skip it
+;;                  collect (directory-file-name rel))
+;;         #'string<))
+(defun sm--scan-via-find (root)
+  "Return relative paths (from ROOT) of git repos under ROOT, using find.
+Directories matching `sm-exclude-paths' are pruned and not descended into."
+  (let* ((default-directory (file-name-as-directory (expand-file-name root)))
+         (exclude-args
+          (when sm-exclude-paths
+            (append '("(")
+                    (cl-loop for res on sm-exclude-paths
+                             append (list "-regex"
+                                          (format ".*\\(%s\\).*" (car res)))
+                             when (cdr res) append '("-o"))
+                    '(")" "-prune" "-o")))))
+    (sort (cl-loop for path in (apply #'process-lines "find" "."
+                                      (append exclude-args
+                                              '("-name" ".git"
+                                                "-prune" "-print")))
+                   ;; "./foo/bar/.git" -> "foo/bar"
+                   for rel = (file-relative-name (file-name-directory path)
+                                                 default-directory)
+                   unless (string= rel "./")
+                   collect (directory-file-name rel))
+          #'string<)))
+
 (defun sm--scan-repo-paths (root &optional dir)
   "Return relative paths (from ROOT) of git repos found under DIR.
-DIR defaults to ROOT.  Descends into repos to find nested repos."
-  (cl-loop for entry in (directory-files (or dir root) t "\\`[^.]")
-           when (and (file-directory-p entry)
-                     (not (file-symlink-p entry)))
-           append (append
-                   (when (file-exists-p (expand-file-name ".git" entry))
-                     (list (file-relative-name entry root)))
-                   (sm--scan-repo-paths root entry))))
+DIR defaults to ROOT.  Descends into repos to find nested repos.
+Paths matching `sm-exclude-paths' are skipped."
+  (cond ((and (null dir) (executable-find "find"))
+         (sm--scan-via-find root))
+        (t
+         (cl-loop for entry in (directory-files (or dir root) t)
+                  for name = (file-name-nondirectory entry)
+                  for rel = (file-relative-name entry root)
+                  when (and (not (member name '("." ".." ".git")))
+                            (file-directory-p entry)
+                            (not (file-symlink-p entry))
+                            (not (sm--excluded-path-p rel)))
+                  append (append
+                          (when (file-exists-p (expand-file-name ".git" entry))
+                            (list rel))
+                          (sm--scan-repo-paths root entry))))))
 
 (defun sm--repo-paths ()
   "Return relative paths of the repos to manage.
