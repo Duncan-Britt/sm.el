@@ -30,6 +30,8 @@
 (require 'ewoc)
 (require 'vc)
 (require 'vc-git)
+(require 'cl-lib)
+(require 'subr-x)
 
 (defgroup sm nil
   "Simple UI for managing git submodules."
@@ -840,15 +842,18 @@ the entry's status while the operation runs (e.g. \"pulling\").  ..."
     (insert line)))
 
 (defun sm--root-dir ()
-  "Return VC root of `default-directory', or nil."
-  (when-let ((backend (vc-responsible-backend default-directory)))
-    (vc-call-backend backend 'root default-directory)))
+  "Return the directory whose repos this buffer manages.
+If `default-directory' is inside a git repo, return that repo's root.
+Otherwise return `default-directory' itself, and repos are discovered by
+scanning for child directories containing `.git'."
+  (or (when-let ((backend (ignore-errors
+                            (vc-responsible-backend default-directory))))
+        (vc-call-backend backend 'root default-directory))
+      default-directory))
 
 (defun sm--project-root-name ()
-  "Return name of project root directory."
-  (if-let (path (sm--root-dir))
-      (file-name-nondirectory (string-trim-right path "/"))
-    (user-error "directory not under source control: %s" default-directory)))
+  "Return name of the managed root directory."
+  (file-name-nondirectory (directory-file-name (sm--root-dir))))
 
 (defun sm-headers ()
   "Render the headers of the *SM* buffer."
@@ -909,9 +914,30 @@ LABEL is a short present-participle string like \"pulling\".")
     (cl-some (lambda (entry) (string-prefix-p root (car entry)))
              sm--processes)))
 
-(defun sm--git-submodule-lines ()
-  "Return output lines of `git submodule status --recursive'."
-  (process-lines vc-git-program "submodule" "status" "--recursive"))
+(defun sm--scan-repo-paths (root &optional dir)
+  "Return relative paths (from ROOT) of git repos found under DIR.
+DIR defaults to ROOT.  Descends into repos to find nested repos."
+  (cl-loop for entry in (directory-files (or dir root) t "\\`[^.]")
+           when (and (file-directory-p entry)
+                     (not (file-symlink-p entry)))
+           append (append
+                   (when (file-exists-p (expand-file-name ".git" entry))
+                     (list (file-relative-name entry root)))
+                   (sm--scan-repo-paths root entry))))
+
+(defun sm--repo-paths ()
+  "Return relative paths of the repos to manage.
+If the root has a `.gitmodules' file, use git's registered
+submodules.  Otherwise scan for child directories that are git
+repos."
+  (let ((root (sm--root-dir)))
+    (if (file-exists-p (expand-file-name ".gitmodules" root))
+        (let ((default-directory root))
+          (mapcar (lambda (line)
+                    (cadr (split-string (substring line 1))))
+                  (process-lines vc-git-program
+                                 "submodule" "status" "--recursive")))
+      (sm--scan-repo-paths root))))
 
 (defun sm--unpulled-changes-p (dir)
   "Return t if remote has unpulled changes, else NIL.
@@ -952,25 +978,22 @@ BRANCH is nil when HEAD is detached."
       ('() (cons nil t)))))
 
 (defun sm--project-get-repos ()
-  "Return a list of `sm--repo-info's for each git submodule, recursively."
+  "Return a list of `sm--repo-info's for each managed repo."
   (mapcar
-   (lambda (line)
-     (pcase-let* ((`(,commit ,rel-path) (split-string (substring line 1)))
-                  (dir (expand-file-name rel-path (sm--root-dir)))
-                  (`(,branch . ,detached-head?) (sm--git-current-branch dir))
-                  (unpulled-changes? (and (not detached-head?) (sm--unpulled-changes-p dir)))
-                  (uncommitted-changes? (sm--uncommitted-changes-p dir))
-                  (unpushed-changes? (sm--unpushed-changes-p dir))
-                  (stashed-changes? (sm--stashed-changes-p dir)))
+   (lambda (rel-path)
+     (pcase-let* ((dir (expand-file-name rel-path (sm--root-dir)))
+                  (`(,branch . ,detached-head?) (sm--git-current-branch dir)))
        (sm-create-repo-info rel-path
-                            (substring commit 0 8)
+                            (let ((default-directory dir))
+                              (sm--head-commit))
                             branch
                             detached-head?
-                            unpulled-changes?
-                            uncommitted-changes?
-                            unpushed-changes?
-                            stashed-changes?)))
-   (sm--git-submodule-lines)))
+                            (and (not detached-head?)
+                                 (sm--unpulled-changes-p dir))
+                            (sm--uncommitted-changes-p dir)
+                            (sm--unpushed-changes-p dir)
+                            (sm--stashed-changes-p dir))))
+   (sm--repo-paths)))
 
 (defun sm-refresh ()
   "Refresh the contents of the *SM* buffer.
@@ -980,7 +1003,6 @@ BRANCH is nil when HEAD is detached."
       (error "Another update process is in progress, cannot run two at a time")
     (let ((inhibit-read-only t))
       (ewoc-set-hf sm--ewoc (sm-headers) "")
-      (ewoc-filter sm--ewoc #'ignore)
       (let ((repos (sm--project-get-repos)))
         (setq sm--column-widths (sm--compute-column-widths repos))
         (ewoc-filter sm--ewoc #'ignore)
